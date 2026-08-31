@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::sync::{sync_datastores, sync_run, AccessMethod, SyncMode, SyncSpec};
+use crate::sync::{sync_datastores, sync_run, SyncMode, SyncSpec};
 use aw_client_rust::blocking::AwClient;
 
 pub fn pull_all(client: &AwClient) -> Result<(), Box<dyn Error>> {

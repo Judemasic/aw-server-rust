@@ -4,7 +4,7 @@ use jni::sys::jstring;
 use jni::JNIEnv;
 use serde_json::json;
 
-use crate::{pull, pull_all};
+use crate::{pull, pull_all, push_with_hostname};
 #[cfg(target_os = "android")]
 use crate::pull_all_from_all_hostnames;
 #[cfg(target_os = "android")]
