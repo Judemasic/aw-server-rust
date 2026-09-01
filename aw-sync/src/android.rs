@@ -1,3 +1,5 @@
+use std::panic::{self, catch_unwind, AssertUnwindSafe};
+
 use aw_client_rust::blocking::AwClient;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
@@ -9,6 +11,23 @@ use crate::{pull, pull_all, push_with_hostname};
 use crate::pull_all_from_all_hostnames;
 #[cfg(target_os = "android")]
 use crate::push_with_hostname_and_device_id;
+
+/// Initialize android_logger for aw-sync library.
+/// Must be called before any other JNI functions that might use the log crate.
+#[no_mangle]
+pub extern "C" fn aw_sync_init_logging(verbosity: i32) {
+    android_logger::init_once(
+        android_logger::Config::default()
+            .with_max_level(log::LevelFilter::from_level(match verbosity {
+                0 => log::Level::Error,
+                1 => log::Level::Warn,
+                2 => log::Level::Info,
+                3 => log::Level::Debug,
+                _ => log::Level::Trace,
+            }))
+            .with_tag("aw-sync"),
+    );
+}
 
 /// Helper function to convert Rust string to Java string
 fn rust_string_to_jstring(env: &JNIEnv, s: String) -> jstring {
@@ -255,47 +274,50 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPushWithDevic
     hostname: JString,
     device_id: JString,
 ) -> jstring {
-    let hostname_str: String = match env.get_string(&hostname) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            let error_msg = format!("Failed to get hostname: {}", e);
-            error!("syncPushWithDeviceId: {}", error_msg);
-            return rust_string_to_jstring(
-                &env,
-                json!({"success": false, "error": error_msg}).to_string(),
-            );
-        }
-    };
+    // Wrap in catch_unwind to prevent Rust panics from SIGABRT-crashing the JNI
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let hostname_str: String = match env.get_string(&hostname) {
+            Ok(s) => s.into(),
+            Err(e) => {
+                let error_msg = format!("Failed to get hostname: {}", e);
+                return json!({"success": false, "error": error_msg}).to_string();
+            }
+        };
 
-    let device_id_str: String = match env.get_string(&device_id) {
-        Ok(s) => s.into(),
-        Err(e) => {
-            let error_msg = format!("Failed to get device_id: {}", e);
-            error!("syncPushWithDeviceId: {}", error_msg);
-            return rust_string_to_jstring(
-                &env,
-                json!({"success": false, "error": error_msg}).to_string(),
-            );
-        }
-    };
+        let device_id_str: String = match env.get_string(&device_id) {
+            Ok(s) => s.into(),
+            Err(e) => {
+                let error_msg = format!("Failed to get device_id: {}", e);
+                return json!({"success": false, "error": error_msg}).to_string();
+            }
+        };
 
-    let result: Result<String, String> = (|| {
-        let client = get_client(port)?;
-        push_with_hostname_and_device_id(&client, &hostname_str, &device_id_str)
-            .map_err(|e| format!("Sync push failed: {}", e))?;
-        Ok(json!({
-            "success": true,
-            "message": "Successfully pushed local data with per-device staging"
-        })
-        .to_string())
-    })();
+        let result: Result<String, String> = (|| {
+            let client = get_client(port)?;
+            push_with_hostname_and_device_id(&client, &hostname_str, &device_id_str)
+                .map_err(|e| format!("Sync push failed: {}", e))?;
+            Ok(json!({
+                "success": true,
+                "message": "Successfully pushed local data with per-device staging"
+            })
+            .to_string())
+        })();
+
+        match result {
+            Ok(msg) => msg,
+            Err(e) => json!({"success": false, "error": format!("{}", e)}).to_string(),
+        }
+    }));
 
     match result {
-        Ok(msg) => rust_string_to_jstring(&env, msg),
-        Err(e) => {
-            error!("syncPushWithDeviceId error: {}", e);
-            let error_json = json!({"success": false, "error": format!("{}", e)}).to_string();
-            rust_string_to_jstring(&env, error_json)
+        Ok(json_str) => rust_string_to_jstring(&env, json_str),
+        Err(panic_err) => {
+            let msg = format!("RUST PANIC in syncPushWithDeviceId: {:?}", panic_err);
+            error!("{}", msg);
+            rust_string_to_jstring(
+                &env,
+                json!({"success": false, "error": msg}).to_string(),
+            )
         }
     }
 }
@@ -308,23 +330,33 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPullAllFromAl
     _class: JClass,
     port: i32,
 ) -> jstring {
-    let result: Result<String, String> = (|| {
-        let client = get_client(port)?;
-        pull_all_from_all_hostnames(&client)
-            .map_err(|e| format!("Sync pull failed: {}", e))?;
-        Ok(json!({
-            "success": true,
-            "message": "Successfully pulled from all hostnames"
-        })
-        .to_string())
-    })();
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let result: Result<String, String> = (|| {
+            let client = get_client(port)?;
+            pull_all_from_all_hostnames(&client)
+                .map_err(|e| format!("Sync pull failed: {}", e))?;
+            Ok(json!({
+                "success": true,
+                "message": "Successfully pulled from all hostnames"
+            })
+            .to_string())
+        })();
+
+        match result {
+            Ok(msg) => msg,
+            Err(e) => json!({"success": false, "error": format!("{}", e)}).to_string(),
+        }
+    }));
 
     match result {
-        Ok(msg) => rust_string_to_jstring(&env, msg),
-        Err(e) => {
-            error!("syncPullAllFromAllHostnames error: {}", e);
-            let error_json = json!({"success": false, "error": format!("{}", e)}).to_string();
-            rust_string_to_jstring(&env, error_json)
+        Ok(json_str) => rust_string_to_jstring(&env, json_str),
+        Err(panic_err) => {
+            let msg = format!("RUST PANIC in syncPullAllFromAllHostnames: {:?}", panic_err);
+            error!("{}", msg);
+            rust_string_to_jstring(
+                &env,
+                json!({"success": false, "error": msg}).to_string(),
+            )
         }
     }
 }
