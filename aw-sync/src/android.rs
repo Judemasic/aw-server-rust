@@ -18,13 +18,13 @@ use crate::push_with_hostname_and_device_id;
 pub extern "C" fn aw_sync_init_logging(verbosity: i32) {
     android_logger::init_once(
         android_logger::Config::default()
-            .with_max_level(log::LevelFilter::from_level(match verbosity {
-                0 => log::Level::Error,
-                1 => log::Level::Warn,
-                2 => log::Level::Info,
-                3 => log::Level::Debug,
-                _ => log::Level::Trace,
-            }))
+            .with_max_level(match verbosity {
+                0 => log::LevelFilter::Error,
+                1 => log::LevelFilter::Warn,
+                2 => log::LevelFilter::Info,
+                3 => log::LevelFilter::Debug,
+                _ => log::LevelFilter::Trace,
+            })
             .with_tag("aw-sync"),
     );
 }
