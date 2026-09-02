@@ -13,10 +13,26 @@ use crate::pull_all_from_all_hostnames;
 #[cfg(target_os = "android")]
 use crate::push_with_hostname_and_device_id;
 
-/// Initialize android_logger for aw-sync library.
-/// Must be called before any other JNI functions that might use the log crate.
+/// Initialize `android_logger` for this library.
+///
+/// Must be called before any other JNI function that might log.
+///
+/// **The name matters.** `SyncInterface.kt` declares `external fun awSyncInitLogging`, so the
+/// JVM looks up `Java_net_activitywatch_android_SyncInterface_awSyncInitLogging`. An earlier
+/// version exported this as a plain C symbol, `aw_sync_init_logging`, which the JVM never finds:
+/// `SyncInterface.<init>` threw `UnsatisfiedLinkError`, `SyncScheduler` caught it and logged
+/// "aw-sync native library unavailable; sync scheduler disabled", and **no sync ran at all** --
+/// the constructor failed before any other JNI function could be reached.
+///
+/// A cfg-gated `cargo check` cannot catch this and neither can rustfmt: the Rust compiles, the
+/// library loads, and the symbol is simply absent under the name Java asks for. It shows up only
+/// on a device.
 #[no_mangle]
-pub extern "C" fn aw_sync_init_logging(verbosity: i32) {
+pub extern "C" fn Java_net_activitywatch_android_SyncInterface_awSyncInitLogging(
+    _env: JNIEnv,
+    _class: JClass,
+    verbosity: i32,
+) {
     android_logger::init_once(
         android_logger::Config::default()
             .with_max_level(match verbosity {
