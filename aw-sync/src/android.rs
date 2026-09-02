@@ -83,7 +83,6 @@ fn get_client(port: i32) -> Result<AwClient, String> {
     AwClient::new_with_api_key(host, port as u16, "aw-sync-android", api_key)
         .map_err(|e| format!("Failed to create client: {}", e))
 }
-}
 
 /// Pull sync data from all hosts in the sync directory
 #[no_mangle]
