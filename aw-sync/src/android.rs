@@ -1,4 +1,5 @@
 use std::panic::{self, catch_unwind, AssertUnwindSafe};
+use std::path::Path;
 
 use aw_client_rust::blocking::AwClient;
 use jni::objects::{JClass, JString};
@@ -35,11 +36,53 @@ fn rust_string_to_jstring(env: &JNIEnv, s: String) -> jstring {
     output.into_raw()
 }
 
-/// Helper function to get AwClient from port
+/// Point this cdylib's `ANDROID_DATA_DIR` at the app's filesDir.
+///
+/// `libaw_sync.so` and `libaw_server.so` are separate cdylibs with separate statics, so
+/// `RustInterface.setDataDir` updates only the server's copy. `SyncInterface.kt` sets
+/// `XDG_DATA_HOME=$filesDir/data` before `loadLibrary`, so filesDir can be recovered from it --
+/// which works on release, `.debug` and work-profile installs alike, and needs no new JNI symbol.
+fn apply_android_data_dir_from_env() {
+    let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") else {
+        return;
+    };
+    let Some(files_dir) = crate::dirs::files_dir_from_xdg_data_home(Path::new(&xdg_data)) else {
+        warn!(
+            "XDG_DATA_HOME={} is not $filesDir/data; leaving android data dir unchanged",
+            xdg_data
+        );
+        return;
+    };
+    let path = files_dir.to_string_lossy();
+    info!("android data dir from XDG_DATA_HOME: {}", path);
+    aw_server::dirs::set_android_data_dir(&path);
+}
+
+/// Build a client for the embedded server, forwarding the API key.
+///
+/// The embedded server enables API-key auth whenever `config.toml` carries `[auth].api_key`, and
+/// `AWPreferences.isDashboardAuthEnabled()` defaults to true -- so a key exists on first run.
+/// A plain `AwClient::new()` here 401s on `GET /api/0/buckets`, which makes every sync report
+/// success while transferring nothing (aw-android#247, aw-server-rust#666). Reading the key
+/// requires the data dir to be correct first, hence the call above.
 fn get_client(port: i32) -> Result<AwClient, String> {
+    apply_android_data_dir_from_env();
     let host = "127.0.0.1";
-    AwClient::new(host, port as u16, "aw-sync-android")
+    let api_key = match crate::util::get_server_config(false, None) {
+        Ok(cfg) => {
+            if cfg.api_key.is_some() {
+                info!("using API key from config.toml for local client");
+            }
+            cfg.api_key
+        }
+        Err(e) => {
+            warn!("failed to read server config for API key: {}", e);
+            None
+        }
+    };
+    AwClient::new_with_api_key(host, port as u16, "aw-sync-android", api_key)
         .map_err(|e| format!("Failed to create client: {}", e))
+}
 }
 
 /// Pull sync data from all hosts in the sync directory
@@ -357,6 +400,50 @@ pub extern "C" fn Java_net_activitywatch_android_SyncInterface_syncPullAllFromAl
                 &env,
                 json!({"success": false, "error": msg}).to_string(),
             )
+        }
+    }
+}
+
+/// Return this device's identity, as the embedded server sees it.
+///
+/// `aw-server` mints a persisted UUID v4 on first run (`aw-server/src/device_id.rs`) and
+/// `setup_local_remote` names each device's directory in the shared sync folder from it. Kotlin
+/// needs the same value -- to recognise which directory under the shared folder is its own, and to
+/// key per-device shared state -- so it is read from the running server rather than minted a
+/// second time. Two independently generated identities would have to be kept in correspondence
+/// forever, and the `.db` path already commits to this one.
+#[no_mangle]
+pub extern "C" fn Java_net_activitywatch_android_SyncInterface_getDeviceId(
+    env: JNIEnv,
+    _class: JClass,
+    port: i32,
+) -> jstring {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let result: Result<String, String> = (|| {
+            let client = get_client(port)?;
+            let info = client
+                .get_info()
+                .map_err(|e| format!("Failed to read server info: {}", e))?;
+            Ok(json!({
+                "success": true,
+                "device_id": info.device_id,
+                "hostname": info.hostname,
+            })
+            .to_string())
+        })();
+
+        match result {
+            Ok(msg) => msg,
+            Err(e) => json!({"success": false, "error": e}).to_string(),
+        }
+    }));
+
+    match result {
+        Ok(json_str) => rust_string_to_jstring(&env, json_str),
+        Err(panic_err) => {
+            let msg = format!("RUST PANIC in getDeviceId: {:?}", panic_err);
+            error!("{}", msg);
+            rust_string_to_jstring(&env, json!({"success": false, "error": msg}).to_string())
         }
     }
 }

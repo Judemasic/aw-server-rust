@@ -2,7 +2,7 @@ use std::error::Error;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::sync::{sync_datastores, sync_run, SyncMode, SyncSpec};
+use crate::sync::{sync_run, SyncMode, SyncSpec};
 use aw_client_rust::blocking::AwClient;
 
 pub fn pull_all(client: &AwClient) -> Result<(), Box<dyn Error>> {
@@ -33,26 +33,21 @@ pub fn pull(host: &str, client: &AwClient) -> Result<(), Box<dyn Error>> {
         })
         .collect::<Vec<_>>();
 
-    // if more than one db, warn and use the largest one
-    if dbs.len() > 1 {
-        warn!(
-            "More than one db found in sync folder for host, choosing largest db {:?}",
-            dbs
-        );
+    if dbs.is_empty() {
+        return Err(format!("No db found in sync folder {:?}", sync_dir).into());
     }
 
-    let db = dbs
-        .into_iter()
-        .max_by_key(|entry| entry.metadata().map(|m| m.len()).unwrap_or(0))
-        .ok_or_else(|| format!("No db found in sync folder {:?}", sync_dir))?;
-
-    let sync_spec = SyncSpec {
-        path: sync_dir.clone(),
-        path_db: Some(db.path().clone()),
-        buckets: None, // Sync all buckets by default
-        start: None,
-    };
-    sync_run(client, &sync_spec, SyncMode::Pull)?;
+    // Every database under this hostname belongs to a different device, so all of them must be
+    // pulled. Picking one by file size silently discarded every other device's data (R19).
+    for db in &dbs {
+        let sync_spec = SyncSpec {
+            path: sync_dir.clone(),
+            path_db: Some(db.path().clone()),
+            buckets: None, // Sync all buckets by default
+            start: None,
+        };
+        sync_run(client, &sync_spec, SyncMode::Pull)?;
+    }
 
     Ok(())
 }
@@ -77,11 +72,17 @@ pub fn push_with_hostname(client: &AwClient, hostname: &str) -> Result<(), Box<d
     Ok(())
 }
 
-/// Push local data to a per-device staging area.
+/// Push local data into this device's own directory under the shared sync folder.
 ///
-/// On Android, each device writes to `<sync_dir>/<hostname>/<device_id>_test.db`
-/// so multiple devices can coexist in the shared sync folder without overwriting
-/// each other's files. This is Phase 1 of multi-device support.
+/// The layout is `<sync_dir>/<hostname>/<device_id>/test.db`. The `<device_id>` level is created
+/// by `setup_local_remote`, which names it from the *server's* `info.device_id` -- a persisted
+/// UUID v4 (see `aw-server/src/device_id.rs`). The `device_id` argument here therefore does not
+/// build the path; it is kept so the Android caller's own identity appears in the log next to it.
+///
+/// An earlier version joined a `<device_id>_staging` level before handing the path to `sync_run`,
+/// which wrote the database one level deeper than `get_remotes()` looks for it
+/// (`./{host}/{device_id}/*.db`). `get_remotes()` then returned an empty list and every pull was a
+/// silent no-op that still reported success.
 pub fn push_with_hostname_and_device_id(
     client: &AwClient,
     hostname: &str,
@@ -91,14 +92,12 @@ pub fn push_with_hostname_and_device_id(
         .map_err(|_| "Could not get sync dir")?
         .join(hostname);
 
-    // Create a device-specific staging directory
-    let device_staging_dir = sync_dir.join(format!("{}_staging", device_id));
-    fs::create_dir_all(&device_staging_dir)
-        .map_err(|e| format!("Failed to create staging dir: {}", e))?;
+    fs::create_dir_all(&sync_dir).map_err(|e| format!("Failed to create sync dir: {}", e))?;
 
-    // Use the device-specific path as our local remote for push staging
+    debug!("Pushing to {sync_dir:?} (calling device_id: {device_id})");
+
     let sync_spec = SyncSpec {
-        path: device_staging_dir,
+        path: sync_dir,
         path_db: None,
         buckets: None,
         start: None,
@@ -150,14 +149,8 @@ fn pull_from_hostname(host: &str, client: &AwClient) -> Result<(), Box<dyn Error
             .collect();
 
         for db_path in &db_files {
-            // Skip the device's own database (we detect this by checking if it
-            // is in the client's own staging area - handled by sync_datastores skip logic)
-            let device_id = device_dir
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or("unknown")
-                .to_string();
-
+            // sync_datastores already skips buckets that originated on this device,
+            // so our own database showing up in this list is harmless.
             let sync_spec = SyncSpec {
                 path: sync_dir.clone(),
                 path_db: Some(db_path.clone()),
