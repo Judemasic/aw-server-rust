@@ -21,19 +21,43 @@ pub(crate) struct Interval {
 /// Upstream's own marker (see `timelineLabels.ts`); the peer name follows its **first** occurrence.
 const SYNCED_FROM: &str = "-synced-from-";
 
-/// Resolve the origin device of one event. Never fails, never drops the event (R19):
+/// Resolve the origin device of a **whole bucket**. Never fails, never drops an event (R19):
 ///
-/// 1. `data["$aw.origin.device"]` is a string -> use it (roadmap 3.1 tag).
+/// 1. any event carries a string `data["$aw.origin.device"]` -> use it (roadmap 3.1 tag). The
+///    lowest such string is taken, so the answer does not depend on event order (R18); in practice
+///    every tagged event in one bucket carries the same value.
 /// 2. else `bucket_id` contains `-synced-from-<peer>` -> look `<peer>` up in `hostname_to_uuid`;
 ///    hit -> the UUID, miss -> the captured string verbatim. The miss branch is load-bearing:
 ///    upstream's stopwatch path names the peer by UUID, not hostname (roadmap 1.5), and an unknown
 ///    hostname stays visible rather than being merged into `own_device`.
 /// 3. else (local bucket, no suffix, no tag) -> `own_device`.
 ///
+/// # Why the bucket, not the event (roadmap 3.4, found on hardware)
+///
+/// Rule 1 used to be applied **per event**, and that split one real device into two. A
+/// `-synced-from-<peer>` bucket accumulates over time: events merged before 3.1 carry no tag and
+/// fell to rule 2 (the hostname), while events merged after it carry the tag and hit rule 1 (the
+/// UUID). The same tablet then appeared as `jude_s_tab_s10_fe` *and* `7b54cfe9-...`, and because
+/// both were "active" over the same instants the classifier read one device as two and invented
+/// contention: the combined view showed *"Syncthing-Fork counted for 10m — also running:
+/// Syncthing-Fork"*.
+///
+/// A bucket only ever holds one peer's events — that is what `-synced-from-<peer>` means, and a
+/// local bucket is ours — so one tagged event settles the whole bucket. This needs no hostname map
+/// and no shared-schema change, and it heals existing databases without a migration.
+///
 /// Public so callers building *per-device* views (roadmap 3.4) attribute raw events by exactly the
 /// same rule the pipeline does, rather than reimplementing it and drifting.
-pub fn resolve_device(event: &Event, bucket_id: &str, input: &PipelineInput) -> String {
-    if let Some(Value::String(uuid)) = event.data.get(EVENT_ORIGIN_KEY) {
+pub fn resolve_bucket_device(events: &[Event], bucket_id: &str, input: &PipelineInput) -> String {
+    let tagged = events
+        .iter()
+        .filter_map(|e| match e.data.get(EVENT_ORIGIN_KEY) {
+            // A non-string tag is corrupt: fall through rather than panic or stringify it.
+            Some(Value::String(uuid)) if !uuid.is_empty() => Some(uuid),
+            _ => None,
+        })
+        .min();
+    if let Some(uuid) = tagged {
         return uuid.clone();
     }
     if let Some(idx) = bucket_id.find(SYNCED_FROM) {
@@ -51,6 +75,8 @@ pub fn resolve_device(event: &Event, bucket_id: &str, input: &PipelineInput) -> 
 fn to_intervals(buckets: &[BucketEvents], input: &PipelineInput) -> Vec<Interval> {
     let mut out = Vec::new();
     for bucket in buckets {
+        // Resolved once for the bucket, not once per event — see `resolve_bucket_device`.
+        let device = resolve_bucket_device(&bucket.events, &bucket.bucket_id, input);
         for event in &bucket.events {
             let start = event.timestamp;
             let end = event.timestamp + event.duration;
@@ -60,7 +86,7 @@ fn to_intervals(buckets: &[BucketEvents], input: &PipelineInput) -> Vec<Interval
             out.push(Interval {
                 start,
                 end,
-                device: resolve_device(event, &bucket.bucket_id, input),
+                device: device.clone(),
                 bucket_id: bucket.bucket_id.clone(),
                 data: event.data.clone(),
             });

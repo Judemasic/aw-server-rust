@@ -33,7 +33,7 @@ mod normalise;
 mod segment;
 
 pub use coalesce::coalesce;
-pub use normalise::resolve_device;
+pub use normalise::resolve_bucket_device;
 
 pub use aw_models::EVENT_ORIGIN_KEY;
 

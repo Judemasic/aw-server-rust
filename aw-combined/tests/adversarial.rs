@@ -387,3 +387,68 @@ fn determinism_through_coalesce() {
     assert_eq!(build(0), build(1));
     assert_eq!(build(1), build(2));
 }
+
+/// The bug found on hardware in roadmap 3.4: one device split into two by per-event origin
+/// resolution, then read as contention with itself.
+///
+/// A `-synced-from-<peer>` bucket accumulates. Events merged before roadmap 3.1 carry no
+/// `$aw.origin.device`; events merged after it do. Resolved per *event*, the untagged ones became
+/// the hostname and the tagged ones the UUID, so the same tablet was two devices overlapping in
+/// time and the combined view reported *"Syncthing-Fork counted for 10m -- also running:
+/// Syncthing-Fork"*. Resolved per *bucket*, one tagged event settles all of them.
+#[test]
+fn one_bucket_is_one_device_even_when_only_some_events_are_tagged() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-android-synced-from-jude_s_tab_s10_fe".into(),
+        // The untagged (pre-3.1) event overlaps the tagged (post-3.1) one exactly.
+        events: vec![
+            plain(0, 600, app("Syncthing-Fork")),
+            tagged(0, 600, "7b54cfe9-uuid", app("Syncthing-Fork")),
+        ],
+    }]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 1);
+    let devs: Vec<&str> = {
+        let mut d: Vec<&str> = segs[0].active.iter().map(|a| a.device.as_str()).collect();
+        d.sort();
+        d.dedup();
+        d
+    };
+    assert_eq!(devs, vec!["7b54cfe9-uuid"], "one bucket must be one device");
+    assert_eq!(
+        segs[0].state,
+        SegmentState::Settled,
+        "a device cannot contend with itself"
+    );
+    assert!(!segs[0].unresolved, "nothing to shade: there is only one device here");
+}
+
+/// The tag wins over the bucket suffix for the *whole* bucket, including its untagged events --
+/// the hostname is only a fallback for a bucket nothing in which has ever been tagged.
+#[test]
+fn untagged_events_follow_their_bucket_tag_not_the_hostname() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-android-synced-from-somehost".into(),
+        events: vec![
+            plain(0, 100, app("A")),
+            tagged(200, 300, "peer-uuid", app("B")),
+        ],
+    }]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 2);
+    for s in &segs {
+        assert_eq!(s.active[0].device, "peer-uuid");
+    }
+}
+
+/// A bucket with no tagged event at all still falls back to the hostname captured from its id,
+/// so a peer that has never synced since 3.1 stays visible as its own device (R19).
+#[test]
+fn wholly_untagged_bucket_still_falls_back_to_hostname() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-android-synced-from-jude_s_tab_s10_fe".into(),
+        events: vec![plain(0, 100, app("A"))],
+    }]);
+    let segs = compute_segments(input);
+    assert_eq!(segs[0].active[0].device, "jude_s_tab_s10_fe");
+}

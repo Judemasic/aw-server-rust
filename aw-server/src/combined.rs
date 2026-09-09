@@ -18,7 +18,7 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 use aw_combined::{
-    coalesce, compute_segments, default_min_contention, resolve_device, BucketEvents,
+    coalesce, compute_segments, default_min_contention, resolve_bucket_device, BucketEvents,
     PipelineInput, Segment,
 };
 use aw_datastore::Datastore;
@@ -114,8 +114,8 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
 
     // Per-device tracks are built from the *raw* events, before idle subtraction and before
     // segmentation: R11 says the per-device rows are unmodified truth, always available underneath
-    // the combined track for comparison. They use `resolve_device` so origin is decided by exactly
-    // the same three-step rule (R19) the pipeline uses.
+    // the combined track for comparison. They use `resolve_bucket_device` so origin is decided by
+    // exactly the same rule (R19) the pipeline uses.
     let devices = device_tracks(&input);
 
     let segments = coalesce(compute_segments(input.clone()));
@@ -159,14 +159,14 @@ fn device_tracks(input: &PipelineInput) -> Vec<Value> {
     let mut by_device: HashMap<String, Vec<Value>> = HashMap::new();
     let mut totals: HashMap<String, i64> = HashMap::new();
     for bucket in &input.activity {
+        let device = resolve_bucket_device(&bucket.events, &bucket.bucket_id, input);
         for event in &bucket.events {
             let seconds = event.duration.num_seconds();
             if seconds <= 0 {
                 continue; // the unlock watcher's zero-width heartbeats would draw nothing
             }
-            let device = resolve_device(event, &bucket.bucket_id, input);
             *totals.entry(device.clone()).or_insert(0) += seconds;
-            by_device.entry(device).or_default().push(json!({
+            by_device.entry(device.clone()).or_default().push(json!({
                 "start": event.timestamp,
                 "end": event.timestamp + event.duration,
                 "seconds": seconds,
