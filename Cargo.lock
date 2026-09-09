@@ -218,6 +218,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aw-combined"
+version = "0.1.0"
+dependencies = [
+ "aw-models",
+ "chrono",
+ "log",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "aw-datastore"
 version = "0.1.0"
 dependencies = [

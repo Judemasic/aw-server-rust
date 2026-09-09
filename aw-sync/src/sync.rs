@@ -24,18 +24,7 @@ use clap::ValueEnum;
 
 use crate::accessmethod::AccessMethod;
 
-/// Event data key holding the UUID of the device an imported event was collected on
-/// (roadmap 3.1, `05_DATA_MODEL.md` §6).
-///
-/// Written only on import, and only onto the *copy* in this device's datastore -- the originating
-/// device's own events are never touched (**R11**). Its value is a device UUID, deliberately not a
-/// hostname: hostnames are display names that can be changed and are already truncated in places
-/// (roadmap 1.10), while `devices/<uuid>/meta.json` and every decision signature key on the UUID.
-///
-/// Distinct from the bucket-level `$aw.sync.origin`, which holds a *hostname* and exists to build
-/// the `-synced-from-<host>` bucket id. Two keys because they answer two questions; sharing one
-/// name for two kinds of value is how the pair would eventually be misread.
-pub const EVENT_ORIGIN_KEY: &str = "$aw.origin.device";
+pub use aw_models::EVENT_ORIGIN_KEY;
 
 #[derive(PartialEq, Eq, Copy, Clone)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]

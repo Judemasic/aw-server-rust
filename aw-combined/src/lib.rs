@@ -1,0 +1,106 @@
+//! Combined-timeline pipeline, first half: normalise ①, segment ②, classify ③.
+//!
+//! Turns every device's post-sync events into a list of non-overlapping **atomic** segments, each
+//! labelled [`SegmentState::Settled`] (0-1 device active) or [`SegmentState::Contended`] (>=2
+//! devices active). Idle time is subtracted before the contention test, and contention shorter than
+//! [`PipelineInput::min_contention`] is absorbed back into `Settled` (roadmap D15/Q1).
+//!
+//! This crate is pure: no datastore access, no file I/O, no clock reads. Callers pass events in.
+//! Attribution (which activity "wins" a contended segment) is roadmap 3.3; decisions are Phase 4.
+//!
+//! See `aw-android/docs/04_COMBINED_TIMELINE.md` §2.
+
+use std::collections::HashMap;
+
+use chrono::{DateTime, Duration, Utc};
+use serde_json::{Map, Value};
+
+use aw_models::Event;
+
+mod classify;
+mod normalise;
+mod segment;
+
+pub use aw_models::EVENT_ORIGIN_KEY;
+
+/// One bucket's events, local or imported. `bucket_id` is kept because it is the fallback route to
+/// the origin device for events imported before roadmap 3.1 (see [`normalise`], rule 2).
+#[derive(Clone, Debug)]
+pub struct BucketEvents {
+    pub bucket_id: String,
+    pub events: Vec<Event>,
+}
+
+/// Everything [`compute_segments`] needs. Built by the caller from its datastore; this crate never
+/// touches one.
+#[derive(Clone, Debug)]
+pub struct PipelineInput {
+    /// This device's UUID. Its own events carry no origin tag and are attributed to it.
+    pub own_device: String,
+    /// hostname -> device UUID, built from `devices/<uuid>/meta.json`. Lookup only, never iterated,
+    /// so it never enters an output ordering (R18).
+    pub hostname_to_uuid: HashMap<String, String>,
+    /// Activity buckets (currentwindow-type), local and `-synced-from-*` alike.
+    pub activity: Vec<BucketEvents>,
+    /// Idle buckets. **Contract: every event here is an idle period.** The caller filters by status
+    /// (e.g. aw-watcher-afk `status == "afk"`); this crate knows no AFK schema. Empty on Android,
+    /// where the watcher only records while the screen is on and in use. Origin is resolved by the
+    /// same rule as `activity`.
+    pub idle: Vec<BucketEvents>,
+    /// Minimum contention duration (roadmap D15/Q1). Use [`default_min_contention`].
+    pub min_contention: Duration,
+}
+
+/// Default for [`PipelineInput::min_contention`] in seconds (roadmap D15/Q1).
+pub const DEFAULT_MIN_CONTENTION_SECS: i64 = 60;
+
+/// Default minimum contention duration: contended runs shorter than this are absorbed into
+/// `Settled` (roadmap D15/Q1).
+pub fn default_min_contention() -> Duration {
+    Duration::seconds(DEFAULT_MIN_CONTENTION_SECS)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SegmentState {
+    Settled,
+    Contended,
+}
+
+/// One device's activity covering a segment. Classification counts *distinct* [`ActiveSlice::device`]
+/// values, so a device with two overlapping activity buckets contributes two slices but one device.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveSlice {
+    pub device: String,
+    pub bucket_id: String,
+    pub data: Map<String, Value>,
+}
+
+/// An atomic segment: a maximal time span over which the set of covering [`ActiveSlice`]s does not
+/// change. Boundaries come from *every* device's app changes, so adjacent segments are never merged
+/// here (coalescing on identical attribution is roadmap 3.3/3.4).
+///
+/// **Invariant:** `state == Settled` does **not** imply <=1 active device. A short-contention run
+/// demoted by the minimum-duration pass is `Settled` with `absorbed_short_contention == true` and
+/// keeps every slice. Consumers wanting "was there really only one device here?" must inspect
+/// [`Segment::active`], not [`Segment::state`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct Segment {
+    pub start: DateTime<Utc>,
+    pub end: DateTime<Utc>,
+    pub state: SegmentState,
+    /// Every device-activity covering this segment, sorted by `(device, bucket_id)`. May hold more
+    /// than one slice per device.
+    pub active: Vec<ActiveSlice>,
+    /// True when this segment held >=2 distinct devices but its contended run was shorter than
+    /// `min_contention` and was demoted to `Settled`.
+    pub absorbed_short_contention: bool,
+}
+
+/// Run ① normalise, ② segment, ③ classify. Deterministic: identical input (in any event/bucket
+/// order) yields byte-identical output (R18).
+pub fn compute_segments(input: PipelineInput) -> Vec<Segment> {
+    let intervals = normalise::normalise(&input);
+    let mut segments = segment::segment(&intervals);
+    classify::classify(&mut segments, input.min_contention);
+    segments
+}

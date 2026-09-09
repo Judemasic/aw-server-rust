@@ -29,6 +29,7 @@ pub use self::bucket::Bucket;
 pub use self::bucket::BucketMetadata;
 pub use self::bucket::BucketsExport;
 pub use self::event::Event;
+pub use self::event::EVENT_ORIGIN_KEY;
 pub use self::info::Info;
 pub use self::query::Query;
 pub use self::settings::Settings;
