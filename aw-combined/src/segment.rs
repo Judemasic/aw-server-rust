@@ -35,6 +35,11 @@ pub(crate) fn segment(intervals: &[Interval]) -> Vec<Segment> {
                 device: iv.device.clone(),
                 bucket_id: iv.bucket_id.clone(),
                 data: iv.data.clone(),
+                // The originating interval's post-idle span, *not* `a`/`b`: rule 1 (R17) compares
+                // how long each device's activity actually ran, and every slice here covers the
+                // segment exactly, so `a`/`b` would make every candidate equal and rule 1 dead.
+                source_start: iv.start,
+                source_end: iv.end,
             })
             .collect();
         if active.is_empty() {
@@ -52,6 +57,8 @@ pub(crate) fn segment(intervals: &[Interval]) -> Vec<Segment> {
             state: SegmentState::Settled, // set by ③
             active,
             absorbed_short_contention: false,
+            foreground: usize::MAX, // set by ⑤
+            unresolved: false,      // set by ⑤
         });
     }
     segments

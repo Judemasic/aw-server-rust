@@ -7,13 +7,18 @@
 
 use std::collections::HashMap;
 
-use aw_combined::{compute_segments, BucketEvents, PipelineInput, SegmentState, EVENT_ORIGIN_KEY};
+use aw_combined::{
+    coalesce, compute_segments, BucketEvents, PipelineInput, SegmentState, EVENT_ORIGIN_KEY,
+};
 use aw_models::Event;
 use chrono::{DateTime, Duration, TimeZone, Utc};
 use serde_json::{json, Map, Value};
 
 fn ts(sec: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 9, 14, 0, 0).unwrap() + Duration::seconds(sec)
+}
+fn tm(min: i64) -> DateTime<Utc> {
+    ts(min * 60)
 }
 fn app(name: &str) -> Map<String, Value> {
     let mut m = Map::new();
@@ -26,6 +31,13 @@ fn tagged(s: i64, e: i64, dev: &str, mut d: Map<String, Value>) -> Event {
 }
 fn plain(s: i64, e: i64, d: Map<String, Value>) -> Event {
     Event { id: None, timestamp: ts(s), duration: ts(e) - ts(s), data: d }
+}
+fn plain_at(s: DateTime<Utc>, e: DateTime<Utc>, d: Map<String, Value>) -> Event {
+    Event { id: None, timestamp: s, duration: e - s, data: d }
+}
+fn tagged_at(s: DateTime<Utc>, e: DateTime<Utc>, dev: &str, mut d: Map<String, Value>) -> Event {
+    d.insert(EVENT_ORIGIN_KEY.to_string(), json!(dev));
+    Event { id: None, timestamp: s, duration: e - s, data: d }
 }
 fn base(activity: Vec<BucketEvents>) -> PipelineInput {
     PipelineInput {
@@ -222,4 +234,156 @@ fn chained_contention_is_one_run() {
     assert_eq!(segs.len(), 2);
     assert_eq!(segs[0].state, SegmentState::Contended);
     assert_eq!(segs[1].state, SegmentState::Contended);
+}
+
+// ---------------------------------------------------------------------------
+// Roadmap 3.3 — ⑤ attribution tiebreaks and ⑥ coalesce edge cases.
+// ---------------------------------------------------------------------------
+
+/// Equal source durations -> the lexicographically lowest `device` wins (rule 2).
+#[test]
+fn tiebreak_equal_durations_lowest_device() {
+    let input = base(vec![
+        BucketEvents {
+            bucket_id: "w-synced-from-b".into(),
+            events: vec![tagged(0, 600, "device-b", app("X"))],
+        },
+        BucketEvents {
+            bucket_id: "w-synced-from-a".into(),
+            events: vec![tagged(0, 600, "device-a", app("Y"))],
+        },
+    ]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].foreground_slice().device, "device-a");
+}
+
+/// One device, two overlapping buckets, equal spans -> lowest `bucket_id`; with equal bucket ids
+/// (two overlapping events in one bucket) -> lowest canonical `data` string.
+#[test]
+fn tiebreak_within_one_device() {
+    // Different bucket ids.
+    let by_bucket = base(vec![
+        BucketEvents {
+            bucket_id: "aw-watcher-window_phone".into(),
+            events: vec![plain(0, 600, app("win"))],
+        },
+        BucketEvents {
+            bucket_id: "aw-watcher-web_phone".into(),
+            events: vec![plain(0, 600, app("web"))],
+        },
+    ]);
+    let segs = compute_segments(by_bucket);
+    assert_eq!(segs[0].foreground_slice().bucket_id, "aw-watcher-web_phone");
+
+    // Same bucket id, two overlapping events -> lowest serialised data.
+    let by_data = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-window_phone".into(),
+        events: vec![plain(0, 600, app("bbb")), plain(0, 600, app("aaa"))],
+    }]);
+    let segs = compute_segments(by_data);
+    assert_eq!(segs[0].foreground_slice().data.get("app").unwrap(), &json!("aaa"));
+}
+
+/// Idle shortens a device's claim: A active 14:00–15:00 with idle 14:10–14:50 (10 min real in the
+/// overlap window), B active 14:00–14:30 (30 min). In their contended overlap **B** is foreground —
+/// the raw event span would have made A (60 min) win.
+#[test]
+fn idle_shortens_the_claim() {
+    let mut input = base(vec![
+        BucketEvents {
+            bucket_id: "aw-watcher-window_phone".into(),
+            events: vec![plain_at(tm(0), tm(60), app("A"))],
+        },
+        BucketEvents {
+            bucket_id: "w-synced-from-b".into(),
+            events: vec![tagged_at(tm(0), tm(30), "device-b", app("B"))],
+        },
+    ]);
+    input.idle = vec![BucketEvents {
+        bucket_id: "aw-watcher-afk_phone".into(),
+        events: vec![plain_at(tm(10), tm(50), Map::new())],
+    }];
+    let segs = compute_segments(input);
+    // Contended slice is 14:00–14:10: phone piece is 10 min post-idle, B is 30 min.
+    let contended: Vec<_> = segs.iter().filter(|s| s.state == SegmentState::Contended).collect();
+    assert_eq!(contended.len(), 1);
+    assert_eq!((contended[0].start, contended[0].end), (tm(0), tm(10)));
+    assert_eq!(contended[0].foreground_slice().device, "device-b");
+}
+
+/// `unresolved` tracks `Contended`, not device count: an absorbed short-contention segment has two
+/// devices, `state == Settled`, `unresolved == false`, and still a valid foreground.
+#[test]
+fn unresolved_tracks_state_not_device_count() {
+    let input = base(vec![
+        BucketEvents {
+            bucket_id: "aw-watcher-window_phone".into(),
+            events: vec![plain(0, 40, app("A"))],
+        },
+        BucketEvents {
+            bucket_id: "w-synced-from-tablet".into(),
+            events: vec![tagged(0, 40, "tablet", app("B"))],
+        },
+    ]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].state, SegmentState::Settled);
+    assert!(segs[0].absorbed_short_contention);
+    assert!(!segs[0].unresolved, "demoted to Settled -> not shaded");
+    assert!(segs[0].foreground < segs[0].active.len());
+}
+
+/// Coalesce does not merge across a flag change: same foreground activity either side, but one
+/// segment `Contended` and the next `Settled`.
+#[test]
+fn coalesce_keeps_flag_change() {
+    let input = base(vec![
+        BucketEvents {
+            bucket_id: "aw-watcher-window_phone".into(),
+            events: vec![plain_at(tm(0), tm(120), app("A"))],
+        },
+        BucketEvents {
+            bucket_id: "w-synced-from-b".into(),
+            events: vec![tagged_at(tm(0), tm(60), "device-b", app("B"))],
+        },
+    ]);
+    let merged = coalesce(compute_segments(input));
+    // 14:00–15:00 contended (phone foreground, 120 min > 60 min), 15:00–16:00 settled phone.
+    assert_eq!(merged.len(), 2);
+    assert_eq!(merged[0].state, SegmentState::Contended);
+    assert_eq!(merged[1].state, SegmentState::Settled);
+    assert_eq!(merged[0].foreground_slice().device, "phone");
+    assert_eq!(merged[1].foreground_slice().device, "phone");
+}
+
+/// Determinism (R18): shuffling bucket and event order leaves `compute_segments` then `coalesce`
+/// byte-identical, including a segment with two slices tied on duration *and* device so tiebreaks
+/// 3 and 4 are exercised.
+#[test]
+fn determinism_through_coalesce() {
+    let build = |order: u8| {
+        let win = BucketEvents {
+            bucket_id: "aw-watcher-window_phone".into(),
+            events: vec![plain(0, 600, app("bbb")), plain(0, 600, app("aaa"))],
+        };
+        let web = BucketEvents {
+            bucket_id: "aw-watcher-web_phone".into(),
+            events: vec![plain(0, 600, app("ccc"))],
+        };
+        let tablet = BucketEvents {
+            bucket_id: "w-synced-from-tablet".into(),
+            events: vec![tagged(200, 800, "tablet", app("Z"))],
+        };
+        let activity = match order {
+            0 => vec![win, web, tablet],
+            1 => vec![tablet, win, web],
+            _ => vec![web, tablet, win],
+        };
+        let mut input = base(activity);
+        input.min_contention = Duration::seconds(1);
+        coalesce(compute_segments(input))
+    };
+    assert_eq!(build(0), build(1));
+    assert_eq!(build(1), build(2));
 }

@@ -4,8 +4,8 @@
 use std::collections::HashMap;
 
 use aw_combined::{
-    compute_segments, default_min_contention, ActiveSlice, BucketEvents, PipelineInput, Segment,
-    SegmentState, EVENT_ORIGIN_KEY,
+    coalesce, compute_segments, default_min_contention, ActiveSlice, BucketEvents, PipelineInput,
+    Segment, SegmentState, EVENT_ORIGIN_KEY,
 };
 use aw_models::Event;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -364,3 +364,87 @@ fn two_slices_one_device_not_contended() {
 
 #[allow(dead_code)]
 fn _slice_type_is_public(_: ActiveSlice) {}
+
+// ---------------------------------------------------------------------------
+// Roadmap 3.3 — ⑤ provisional attribution and ⑥ coalesce (worked examples).
+// ---------------------------------------------------------------------------
+
+// A1. Rule 1 (R17) actually discriminates: the longest-running *originating activity* is foreground,
+//     not the lowest device UUID. Phone YouTube 14:00–15:00 (60 min) vs tablet Kindle 14:30–14:45
+//     (15 min). The tablet's device string sorts LOWER than the phone's, so if source spans were
+//     wrongly set to the segment's own length every slice would be equal and the tiebreak would pick
+//     the tablet — this test would then fail, which is its whole point.
+#[test]
+fn attribution_longest_activity_wins_over_tiebreak() {
+    let input = base(vec![
+        BucketEvents {
+            bucket_id: "aw-watcher-window_phone".to_string(),
+            events: vec![plain(t(0), t(60), app("YouTube"))],
+        },
+        BucketEvents {
+            bucket_id: "w-synced-from-tablet".to_string(),
+            events: vec![tagged(t(30), t(45), "aaa-tablet", app("Kindle"))],
+        },
+    ]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 3);
+    // 14:30–14:45 is the contended overlap.
+    let mid = &segs[1];
+    assert_eq!((mid.start, mid.end), (t(30), t(45)));
+    assert_eq!(mid.state, SegmentState::Contended);
+    assert!(mid.unresolved);
+    assert_eq!(mid.foreground_slice().device, "phone", "60 min beats 15 min despite UUID order");
+    assert_eq!(mid.foreground_slice().data.get("app").unwrap(), &json!("YouTube"));
+    let bg: Vec<_> = mid.background_slices().map(|s| s.device.as_str()).collect();
+    assert_eq!(bg, vec!["aaa-tablet"]);
+}
+
+// A2. Coalesce merges a heartbeat-split session: one device, YouTube 14:00–14:30 then
+//     YouTube 14:30–15:00 as two events with identical data -> two atomic segments, one after
+//     coalesce spanning 14:00–15:00.
+#[test]
+fn coalesce_merges_heartbeat_split_session() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-window_phone".to_string(),
+        events: vec![
+            plain(t(0), t(30), app("YouTube")),
+            plain(t(30), t(60), app("YouTube")),
+        ],
+    }]);
+    let segs = compute_segments(input);
+    assert_eq!(segs.len(), 2, "atomic: a boundary at every event edge");
+    let merged = coalesce(segs);
+    assert_eq!(merged.len(), 1);
+    assert_eq!((merged[0].start, merged[0].end), (t(0), t(60)));
+    // The merged foreground slice describes the whole span.
+    assert_eq!(merged[0].foreground_slice().source_start, t(0));
+    assert_eq!(merged[0].foreground_slice().source_end, t(60));
+}
+
+// A3. Coalesce does NOT merge across an app change.
+#[test]
+fn coalesce_keeps_app_change() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-window_phone".to_string(),
+        events: vec![
+            plain(t(0), t(30), app("YouTube")),
+            plain(t(30), t(60), app("Kindle")),
+        ],
+    }]);
+    let merged = coalesce(compute_segments(input));
+    assert_eq!(merged.len(), 2);
+}
+
+// A4. Coalesce does NOT merge across a time gap, even with the same app either side.
+#[test]
+fn coalesce_keeps_gap() {
+    let input = base(vec![BucketEvents {
+        bucket_id: "aw-watcher-window_phone".to_string(),
+        events: vec![
+            plain(t(0), t(20), app("YouTube")),
+            plain(t(30), t(50), app("YouTube")),
+        ],
+    }]);
+    let merged = coalesce(compute_segments(input));
+    assert_eq!(merged.len(), 2, "a 10-minute hole is not bridged");
+}

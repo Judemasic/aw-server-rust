@@ -25,9 +25,13 @@ use serde_json::{Map, Value};
 
 use aw_models::Event;
 
+mod attribute;
 mod classify;
+mod coalesce;
 mod normalise;
 mod segment;
+
+pub use coalesce::coalesce;
 
 pub use aw_models::EVENT_ORIGIN_KEY;
 
@@ -81,6 +85,13 @@ pub struct ActiveSlice {
     pub device: String,
     pub bucket_id: String,
     pub data: Map<String, Value>,
+    /// Start of the *originating* activity interval this slice was cut from — **after** idle
+    /// subtraction, so idle time never inflates a device's claim. Not the segment's own start.
+    pub source_start: DateTime<Utc>,
+    /// End of that interval. `source_end - source_start` is the duration provisional attribution's
+    /// rule 1 compares (R17): the longest-running originating activity wins the segment, not the
+    /// segment's own (identical for every slice) length.
+    pub source_end: DateTime<Utc>,
 }
 
 /// An atomic segment: a maximal time span over which the set of covering [`ActiveSlice`]s does not
@@ -102,13 +113,42 @@ pub struct Segment {
     /// True when this segment held >=2 distinct devices but its contended run was shorter than
     /// `min_contention` and was demoted to `Settled`.
     pub absorbed_short_contention: bool,
+    /// Index into [`Segment::active`] of the slice that counts as **foreground** (R6: exactly one
+    /// activity is foreground at any instant). Set by ⑤ provisional attribution. Every segment has
+    /// at least one slice, so this is always a valid index. `usize::MAX` before ⑤ has run.
+    pub foreground: usize,
+    /// True when this segment is contended and no decision has resolved it, so the view shades it
+    /// (R8). Provisional attribution changes *which* activity counts; it never clears the shading
+    /// (`04` §2.4). A short-contention segment demoted to `Settled` has `unresolved == false`.
+    pub unresolved: bool,
 }
 
-/// Run ① normalise, ② segment, ③ classify. Deterministic: identical input (in any event/bucket
-/// order) yields byte-identical output (R18).
+impl Segment {
+    /// The slice ⑤ picked as foreground. Panics only if called before attribution has run.
+    pub fn foreground_slice(&self) -> &ActiveSlice {
+        &self.active[self.foreground]
+    }
+
+    /// Every slice other than the foreground one, in `active` order.
+    pub fn background_slices(&self) -> impl Iterator<Item = &ActiveSlice> {
+        self.active
+            .iter()
+            .enumerate()
+            .filter(move |(i, _)| *i != self.foreground)
+            .map(|(_, s)| s)
+    }
+}
+
+/// Run ① normalise, ② segment, ③ classify, ⑤ provisional attribution. Deterministic: identical
+/// input (in any event/bucket order) yields byte-identical output (R18).
+///
+/// Step ④ (apply decisions) is Phase 4 and slots in between ③ and ⑤. Step ⑥ ([`coalesce`]) is a
+/// separate opt-in call — the pipeline stays lossless by default so Phase 4 can attach decisions
+/// to the atomic segments.
 pub fn compute_segments(input: PipelineInput) -> Vec<Segment> {
     let intervals = normalise::normalise(&input);
     let mut segments = segment::segment(&intervals);
     classify::classify(&mut segments, input.min_contention);
+    attribute::attribute(&mut segments);
     segments
 }
