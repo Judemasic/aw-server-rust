@@ -21,6 +21,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Duration, Utc};
+use serde::Serialize;
 use serde_json::{Map, Value};
 
 use aw_models::Event;
@@ -32,6 +33,7 @@ mod normalise;
 mod segment;
 
 pub use coalesce::coalesce;
+pub use normalise::resolve_device;
 
 pub use aw_models::EVENT_ORIGIN_KEY;
 
@@ -72,7 +74,8 @@ pub fn default_min_contention() -> Duration {
     Duration::seconds(DEFAULT_MIN_CONTENTION_SECS)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SegmentState {
     Settled,
     Contended,
@@ -80,7 +83,7 @@ pub enum SegmentState {
 
 /// One device's activity covering a segment. Classification counts *distinct* [`ActiveSlice::device`]
 /// values, so a device with two overlapping activity buckets contributes two slices but one device.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct ActiveSlice {
     pub device: String,
     pub bucket_id: String,
@@ -102,7 +105,7 @@ pub struct ActiveSlice {
 /// demoted by the minimum-duration pass is `Settled` with `absorbed_short_contention == true` and
 /// keeps every slice. Consumers wanting "was there really only one device here?" must inspect
 /// [`Segment::active`], not [`Segment::state`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Segment {
     pub start: DateTime<Utc>,
     pub end: DateTime<Utc>,

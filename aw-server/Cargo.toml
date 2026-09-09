@@ -43,6 +43,7 @@ subtle = "2"
 rust-embed = { version = "8.0.0", features = ["interpolate-folder-path", "debug-embed"] }
 aw-datastore = { path = "../aw-datastore", default-features = false }
 aw-models = { path = "../aw-models" }
+aw-combined = { path = "../aw-combined" }
 aw-transform = { path = "../aw-transform" }
 aw-query = { path = "../aw-query" }
 

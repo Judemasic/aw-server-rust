@@ -264,6 +264,64 @@ pub mod android {
         }
     }
 
+    /// Roadmap 3.4 — the combined timeline for one range, as JSON.
+    ///
+    /// All three arguments are strings because JNI is cheapest that way and because two of them are
+    /// things only Kotlin can know: the range the view is showing, and the hostname→uuid map, which
+    /// lives in `devices/<uuid>/meta.json` behind Android's SAF where Rust cannot reach it. The own
+    /// device uuid is read here, from aw-server's own `device_id` file, so the two halves cannot
+    /// disagree about who "we" are.
+    ///
+    /// Timestamps are RFC 3339. A malformed one is an error object, not a panic across the FFI
+    /// boundary. All the real work is in `crate::combined`, which a desktop `cargo check` compiles.
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getCombinedTimeline(
+        env: JNIEnv,
+        _: JClass,
+        java_start: JString,
+        java_end: JString,
+        java_hostname_map: JString,
+    ) -> jstring {
+        use crate::combined::{combined_timeline, TimelineRequest};
+        use chrono::{DateTime, Utc};
+        use std::collections::HashMap;
+
+        let parse = |s: &str| -> Result<DateTime<Utc>, String> {
+            DateTime::parse_from_rfc3339(s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| format!("bad timestamp {s:?}: {e}"))
+        };
+
+        let start_str = jstring_to_string(&env, java_start);
+        let end_str = jstring_to_string(&env, java_end);
+        let (start, end) = match (parse(&start_str), parse(&end_str)) {
+            (Ok(s), Ok(e)) => (s, e),
+            (Err(msg), _) | (_, Err(msg)) => return create_error_object(&env, msg),
+        };
+        if end <= start {
+            return create_error_object(&env, "end must be after start".to_string());
+        }
+
+        let map_str = jstring_to_string(&env, java_hostname_map);
+        let hostname_to_uuid: HashMap<String, String> = match serde_json::from_str(&map_str) {
+            Ok(m) => m,
+            Err(e) => {
+                return create_error_object(&env, format!("bad hostname→uuid map: {e}"));
+            }
+        };
+
+        let req = TimelineRequest {
+            start,
+            end,
+            own_device: device_id::get_device_id(),
+            hostname_to_uuid,
+        };
+        match combined_timeline(&openDatastore(), &req) {
+            Ok(value) => string_to_jstring(&env, value.to_string()),
+            Err(msg) => create_error_object(&env, msg),
+        }
+    }
+
     #[no_mangle]
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_migrateHostname(
         env: JNIEnv,

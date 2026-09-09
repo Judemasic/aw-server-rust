@@ -29,7 +29,10 @@ const SYNCED_FROM: &str = "-synced-from-";
 ///    upstream's stopwatch path names the peer by UUID, not hostname (roadmap 1.5), and an unknown
 ///    hostname stays visible rather than being merged into `own_device`.
 /// 3. else (local bucket, no suffix, no tag) -> `own_device`.
-fn resolve_device(event: &Event, bucket_id: &str, input: &PipelineInput) -> String {
+///
+/// Public so callers building *per-device* views (roadmap 3.4) attribute raw events by exactly the
+/// same rule the pipeline does, rather than reimplementing it and drifting.
+pub fn resolve_device(event: &Event, bucket_id: &str, input: &PipelineInput) -> String {
     if let Some(Value::String(uuid)) = event.data.get(EVENT_ORIGIN_KEY) {
         return uuid.clone();
     }
