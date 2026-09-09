@@ -343,6 +343,75 @@ pub mod android {
         }
     }
 
+    /// Every stored setting, as one JSON object keyed the way `GET /api/0/settings` keys them
+    /// (the `settings.` prefix stripped).
+    ///
+    /// **Values are the stored bodies verbatim, as strings** -- `{"startOfDay": "\"04:00\"",
+    /// "classes": "[{...}]"} `-- deliberately unlike the HTTP endpoint, which parses them. The
+    /// settings sync (roadmap 2.3) copies a value from one device to another and compares it
+    /// against what it last applied; parsing and re-serialising on the way through would reformat
+    /// it (key order above all) and make two devices holding the same setting disagree about
+    /// whether it had changed. Verbatim strings propagate byte for byte and compare exactly.
+    ///
+    /// Only settings the user has actually saved appear here -- the datastore holds nothing for a
+    /// key still sitting at aw-webui's built-in default. That is what makes it safe for the
+    /// settings sync (roadmap 2.3) to publish everything it finds: it publishes choices, never
+    /// defaults that merely happen to be this build's.
+    ///
+    /// JNI rather than HTTP for the reason `getSetting` gives above: API-key auth is on by default
+    /// on Android, so an unauthenticated GET from a worker 401s and quietly reads as "no settings".
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getSettings(
+        env: JNIEnv,
+        _: JClass,
+    ) -> jstring {
+        match openDatastore().get_key_values("settings.%") {
+            Ok(settings) => {
+                let mut map = serde_json::Map::new();
+                for (key, value) in settings.iter() {
+                    let stripped = key.strip_prefix("settings.").unwrap_or(key).to_string();
+                    map.insert(stripped, serde_json::Value::String(value.clone()));
+                }
+                string_to_jstring(&env, serde_json::Value::Object(map).to_string())
+            }
+            Err(e) => create_error_object(&env, format!("Failed to read settings: {:?}", e)),
+        }
+    }
+
+    /// Write one setting, matching `POST /api/0/settings/<key>`.
+    ///
+    /// `java_value` is the raw JSON body -- `"fun"` with its quotes for a string, `[...]` for
+    /// `classes` -- and is rejected unless it parses, so a malformed value cannot be stored where
+    /// aw-webui would later fail to read it.
+    ///
+    /// Returns `{"success": true}` or an object with an `error`.
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_setSetting(
+        env: JNIEnv,
+        _: JClass,
+        java_key: JString,
+        java_value: JString,
+    ) -> jstring {
+        let key = jstring_to_string(&env, java_key);
+        // The same guard `getSetting` applies, for the same reason: JNI must not be able to reach
+        // a key the HTTP router would refuse to route to.
+        if key.is_empty() || key.contains('/') || key.contains('\\') || key.contains('\0') {
+            return create_error_object(&env, "invalid settings key".to_string());
+        }
+        let setting_key = match crate::endpoints::settings_datastore_key(&key) {
+            Ok(k) => k,
+            Err(msg) => return create_error_object(&env, msg.to_string()),
+        };
+        let value = jstring_to_string(&env, java_value);
+        if serde_json::from_str::<serde_json::Value>(&value).is_err() {
+            return create_error_object(&env, format!("value for {} is not valid JSON", key));
+        }
+        match openDatastore().set_key_value(&setting_key, &value) {
+            Ok(()) => string_to_jstring(&env, json!({ "success": true }).to_string()),
+            Err(e) => create_error_object(&env, format!("Failed to write {}: {:?}", key, e)),
+        }
+    }
+
     #[no_mangle]
     pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_query(
         env: JNIEnv,
