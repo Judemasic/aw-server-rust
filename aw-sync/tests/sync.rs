@@ -203,6 +203,126 @@ mod sync_tests {
         );
     }
 
+    /// Roadmap 3.1: an event copied in from another device must say which device that was, so the
+    /// combined timeline can attribute it without parsing bucket ids.
+    #[test]
+    fn test_imported_events_are_tagged_with_origin() {
+        let state = init_teststate();
+        let bucket_id = create_bucket(&state.ds_src, 0);
+        create_events(&state.ds_src, &bucket_id, 3);
+
+        aw_sync::sync_datastores(
+            &state.ds_src,
+            &state.ds_dest,
+            false, // pull/import
+            Some("uuid-of-device-0"),
+            &SyncSpec::default(),
+        );
+
+        let imported_id = format!("{bucket_id}-synced-from-device-0");
+        let events = state
+            .ds_dest
+            .get_events(imported_id.as_str(), None, None, None)
+            .unwrap();
+        assert_eq!(
+            events.len(),
+            3,
+            "expected every source event to be imported"
+        );
+        for event in &events {
+            assert_eq!(
+                event
+                    .data
+                    .get(aw_sync::EVENT_ORIGIN_KEY)
+                    .and_then(|v| v.as_str()),
+                Some("uuid-of-device-0"),
+                "imported event is missing its origin tag: {:?}",
+                event.data
+            );
+        }
+
+        // The source is untouched: tagging happens on the copy, never on the device's own
+        // record of what it did (R11).
+        for event in state
+            .ds_src
+            .get_events(bucket_id.as_str(), None, None, None)
+            .unwrap()
+        {
+            assert!(
+                !event.data.contains_key(aw_sync::EVENT_ORIGIN_KEY),
+                "source events must not be modified, got: {:?}",
+                event.data
+            );
+        }
+    }
+
+    /// The staging copy this device offers to its peers is its own first-hand data. Tagging it
+    /// would hand every peer a provenance claim we made up about ourselves.
+    #[test]
+    fn test_pushed_events_are_not_tagged_with_origin() {
+        let state = init_teststate();
+        let bucket_id = create_bucket(&state.ds_src, 0);
+        create_events(&state.ds_src, &bucket_id, 2);
+
+        aw_sync::sync_datastores(
+            &state.ds_src,
+            &state.ds_dest,
+            true, // push to staging
+            Some("uuid-of-device-0"),
+            &SyncSpec::default(),
+        );
+
+        for event in state
+            .ds_dest
+            .get_events(bucket_id.as_str(), None, None, None)
+            .unwrap()
+        {
+            assert!(
+                !event.data.contains_key(aw_sync::EVENT_ORIGIN_KEY),
+                "staged event must not carry an origin tag, got: {:?}",
+                event.data
+            );
+        }
+    }
+
+    /// A tag that is already on an event is a truer statement of where it came from than the
+    /// directory this particular copy happened to be read out of, so it is never overwritten.
+    #[test]
+    fn test_existing_origin_tag_is_preserved() {
+        let state = init_teststate();
+        let bucket_id = create_bucket(&state.ds_src, 0);
+        let event: Event = serde_json::from_value(serde_json::json!({
+            "timestamp": Utc::now().to_rfc3339(),
+            "duration": 0,
+            "data": { "test": 1, aw_sync::EVENT_ORIGIN_KEY: "uuid-of-the-real-origin" }
+        }))
+        .unwrap();
+        state.ds_src.insert_events(&bucket_id, &[event]).unwrap();
+        state.ds_src.force_commit().unwrap();
+
+        aw_sync::sync_datastores(
+            &state.ds_src,
+            &state.ds_dest,
+            false, // pull/import
+            Some("uuid-of-the-relaying-device"),
+            &SyncSpec::default(),
+        );
+
+        let imported_id = format!("{bucket_id}-synced-from-device-0");
+        let events = state
+            .ds_dest
+            .get_events(imported_id.as_str(), None, None, None)
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]
+                .data
+                .get(aw_sync::EVENT_ORIGIN_KEY)
+                .and_then(|v| v.as_str()),
+            Some("uuid-of-the-real-origin"),
+        );
+    }
+
     fn check_synced_buckets_equal_to_src(all_buckets_map: &HashMap<String, (&Datastore, Bucket)>) {
         for (ds, bucket) in all_buckets_map.values() {
             if bucket.id.contains("-synced") {

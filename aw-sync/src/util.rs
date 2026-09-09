@@ -77,7 +77,7 @@ pub fn host_for_url(host: &str) -> String {
 
 #[cfg(all(test, not(target_os = "android")))]
 mod tests {
-    use super::{get_server_config, host_for_url, is_loopback_host};
+    use super::{get_server_config, host_for_url, is_loopback_host, origin_from_db_path};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -159,6 +159,19 @@ mod tests {
         assert_eq!(host_for_url("127.0.0.1"), "127.0.0.1");
         assert_eq!(host_for_url("localhost"), "localhost");
     }
+
+    #[test]
+    fn origin_is_the_directory_holding_the_db() {
+        let path = std::path::Path::new("/sync/jude_s_s25_ultra/9f0c-uuid/test.db");
+        assert_eq!(origin_from_db_path(path).as_deref(), Some("9f0c-uuid"));
+    }
+
+    #[test]
+    fn origin_is_none_when_there_is_no_containing_directory() {
+        // A bare filename's parent is the empty path -- there is no device name to be had, and
+        // inventing one would mislabel every event in the file.
+        assert_eq!(origin_from_db_path(std::path::Path::new("test.db")), None);
+    }
 }
 
 /// Check if a directory contains a .db file
@@ -207,6 +220,25 @@ pub fn get_remotes() -> Result<Vec<String>, Box<dyn Error>> {
         .collect();
     info!("Found remotes: {:?}", hostnames);
     Ok(hostnames)
+}
+
+/// The device UUID a remote database belongs to, taken from the directory containing it.
+///
+/// The shared folder is laid out `<sync root>/<hostname>/<device uuid>/<file>.db` (see
+/// `sync_wrapper::pull`), so the parent directory *is* the device that wrote the file. Reading
+/// origin from the path at merge time is what lets a device leave its own events completely
+/// untouched when it exports them (**R11**, `05_DATA_MODEL.md` §6) -- nothing is stamped at
+/// capture time, and the importer works it out from where the file sat.
+///
+/// Returns `None` rather than guessing when there is no usable parent directory name. An event
+/// that arrives untagged can still be attributed from its bucket; an event tagged with the wrong
+/// device cannot be told apart from a correct one.
+pub fn origin_from_db_path(path: &Path) -> Option<String> {
+    path.parent()?
+        .file_name()
+        .and_then(OsStr::to_str)
+        .filter(|name| !name.is_empty())
+        .map(String::from)
 }
 
 /// Returns a list of all remote dbs

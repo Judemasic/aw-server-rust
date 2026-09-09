@@ -24,6 +24,19 @@ use clap::ValueEnum;
 
 use crate::accessmethod::AccessMethod;
 
+/// Event data key holding the UUID of the device an imported event was collected on
+/// (roadmap 3.1, `05_DATA_MODEL.md` §6).
+///
+/// Written only on import, and only onto the *copy* in this device's datastore -- the originating
+/// device's own events are never touched (**R11**). Its value is a device UUID, deliberately not a
+/// hostname: hostnames are display names that can be changed and are already truncated in places
+/// (roadmap 1.10), while `devices/<uuid>/meta.json` and every decision signature key on the UUID.
+///
+/// Distinct from the bucket-level `$aw.sync.origin`, which holds a *hostname* and exists to build
+/// the `-synced-from-<host>` bucket id. Two keys because they answer two questions; sharing one
+/// name for two kinds of value is how the pair would eventually be misread.
+pub const EVENT_ORIGIN_KEY: &str = "$aw.origin.device";
+
 #[derive(PartialEq, Eq, Copy, Clone)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]
 pub enum SyncMode {
@@ -90,10 +103,18 @@ pub fn sync_run(
     }
 
     // TODO: Check for compatible remote db version before opening
-    let ds_remotes: Vec<Datastore> = remote_dbfiles
+    // Each remote is paired with the device it belongs to, because the only place that is
+    // knowable is here, where the file's path is still in hand: the directory containing the
+    // database is named after the device that wrote it (`origin_from_db_path`).
+    let ds_remotes: Vec<(Option<String>, Datastore)> = remote_dbfiles
         .iter()
-        .map(|p| p.as_path())
-        .map(create_datastore)
+        .map(|p| {
+            let origin = crate::util::origin_from_db_path(p);
+            if origin.is_none() {
+                warn!("Cannot tell which device {p:?} belongs to; importing it untagged");
+            }
+            (origin, create_datastore(p.as_path()))
+        })
         .collect();
 
     if !ds_remotes.is_empty() {
@@ -107,8 +128,8 @@ pub fn sync_run(
     // Pull
     if mode == SyncMode::Pull || mode == SyncMode::Both {
         info!("Pulling...");
-        for ds_from in &ds_remotes {
-            sync_datastores(ds_from, client, false, None, sync_spec);
+        for (origin, ds_from) in &ds_remotes {
+            sync_datastores(ds_from, client, false, origin.as_deref(), sync_spec);
         }
     }
 
@@ -119,7 +140,7 @@ pub fn sync_run(
     }
 
     // Close open database connections
-    for ds_from in &ds_remotes {
+    for (_, ds_from) in &ds_remotes {
         ds_from.close();
     }
     ds_localremote.close();
@@ -276,7 +297,10 @@ fn is_synced_bucket(bucket: &Bucket) -> bool {
 ///
 /// is_push: a bool indicating if we're pushing local buckets to the sync dir
 ///          (as opposed to pulling from remotes)
-/// src_did: source device ID
+/// src_did: the device the source data belongs to. On push that is this device; on import it is
+///          the peer whose directory the database was read from, and every event copied in is
+///          tagged with it ([`EVENT_ORIGIN_KEY`]) so the combined timeline can tell whose
+///          activity is whose without re-deriving it from bucket ids.
 pub fn sync_datastores(
     ds_from: &dyn AccessMethod,
     ds_to: &dyn AccessMethod,
@@ -324,8 +348,20 @@ pub fn sync_datastores(
         .map(|tup| {
             // TODO: Refuse to sync buckets without hostname/device ID set, or if set to 'unknown'
             if tup.1.hostname == "unknown" {
-                warn!(" ! Bucket hostname/device ID was invalid, setting to device ID/hostname");
-                tup.1.hostname = src_did.unwrap().to_string();
+                // This used to be `src_did.unwrap()`, which was a panic waiting on the import
+                // path: src_did was always None there. Import now knows the source device, but a
+                // missing one must still not take the process down over one malformed bucket.
+                match src_did {
+                    Some(did) => {
+                        warn!(
+                            " ! Bucket hostname/device ID was invalid, setting to device ID/hostname"
+                        );
+                        tup.1.hostname = did.to_string();
+                    }
+                    None => warn!(
+                        " ! Bucket hostname/device ID was invalid and the source device is unknown"
+                    ),
+                }
             }
             tup.1.clone()
         })
@@ -343,10 +379,28 @@ pub fn sync_datastores(
     // Sync buckets in order of most recently updated
     buckets_from.sort_by_key(|b| b.metadata.end);
 
+    // Nothing is stamped on the way out. A staging copy is data this device is offering as its
+    // own first-hand record, and an origin tag on it would come back from a peer as provenance
+    // it never had.
+    let origin = if is_push { None } else { src_did };
+
     for bucket_from in buckets_from {
         let bucket_to = get_or_create_sync_bucket(&bucket_from, ds_to, is_push);
-        sync_one(ds_from, ds_to, bucket_from, bucket_to, sync_spec);
+        sync_one(ds_from, ds_to, bucket_from, bucket_to, sync_spec, origin);
     }
+}
+
+/// Record on an imported event which device collected it (roadmap 3.1).
+///
+/// An existing [`EVENT_ORIGIN_KEY`] is left alone rather than overwritten: if a tag is ever
+/// present already it is a truer statement of where the event came from than the directory this
+/// particular copy was read out of.
+fn tag_origin(event: &mut Event, origin: Option<&str>) {
+    let Some(origin) = origin else { return };
+    event
+        .data
+        .entry(EVENT_ORIGIN_KEY.to_string())
+        .or_insert_with(|| serde_json::json!(origin));
 }
 
 /// Syncs a single bucket from one datastore to another
@@ -356,6 +410,7 @@ fn sync_one(
     bucket_from: Bucket,
     bucket_to: Bucket,
     sync_spec: &SyncSpec,
+    origin: Option<&str>,
 ) {
     let eventcount_to_old = ds_to.get_event_count(bucket_to.id.as_str()).unwrap();
     info!(" ⟳  Syncing bucket '{}'", bucket_to.id);
@@ -423,6 +478,10 @@ fn sync_one(
             .map(|mut e| {
                 // Unset ID on events, as they are not globally unique
                 e.id = None;
+                // Tag before anything writes it, so every path below -- paged insert, last-page
+                // insert and the boundary heartbeat -- carries the tag without having to
+                // remember to.
+                tag_origin(&mut e, origin);
                 e
             })
             .collect();
@@ -470,6 +529,9 @@ fn sync_one(
             chunk.reverse(); // chunk is now ASC (oldest first)
 
             // Use heartbeat() for the oldest event only in the single-page case:
+            // (Note: at the first import after origin tagging was introduced, the resume-boundary
+            // row is untagged and the new event is tagged, so their data differ and heartbeat
+            // inserts instead of extending. That costs one extra row at the seam, once.)
             // dest's "last event" is still the pre-sync resume-boundary row, so heartbeat()
             // can correctly merge an adjacent new event into it (delta=0.0 → exact adjacency).
             // In multi-page syncs, newer pages are already in dest, so heartbeat() would
@@ -499,7 +561,15 @@ fn sync_one(
     let new_events_count = eventcount_to_new - eventcount_to_old;
     assert!(new_events_count >= 0);
     if new_events_count > 0 {
-        info!("  = Synced {} new events", new_events_count);
+        // The origin is named here rather than only in the code because it is the only way to
+        // check 3.1 on a device: the tag lands inside event data, which nothing in the UI is
+        // guaranteed to surface, and app-private storage is not readable over adb.
+        match origin {
+            Some(origin) => {
+                info!("  = Synced {new_events_count} new events, tagged origin {origin}")
+            }
+            None => info!("  = Synced {new_events_count} new events"),
+        }
     } else {
         info!("  ✓ Already up to date!");
     }
