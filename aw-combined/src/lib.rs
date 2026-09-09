@@ -9,6 +9,14 @@
 //! Attribution (which activity "wins" a contended segment) is roadmap 3.3; decisions are Phase 4.
 //!
 //! See `aw-android/docs/04_COMBINED_TIMELINE.md` §2.
+//!
+//! # Scaling
+//!
+//! [`compute_segments`] is **O(n²)** in the event count: [`segment`] tests every interval against
+//! every boundary. Measured on desktop (release, 3 devices): 3k events 18 ms, 6k 52 ms, 15k 253 ms,
+//! 30k 870 ms. A single day is a few thousand events, so this is comfortable for the day view; a
+//! week or month view would need a sweep line that keeps a running active-set instead of rescanning
+//! (roadmap 3.4 onward).
 
 use std::collections::HashMap;
 
