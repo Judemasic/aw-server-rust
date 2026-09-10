@@ -21,6 +21,8 @@ use rocket::http::Status;
 use rocket::serde::json::{Json, Value};
 use rocket::State;
 
+use aw_combined::synced_from_hostname;
+
 use crate::combined::{combined_timeline, store_record, stored_records, TimelineRequest};
 use crate::endpoints::{HttpErrorJson, ServerState};
 
@@ -35,6 +37,55 @@ fn parse_ts(name: &str, raw: &str) -> Result<DateTime<Utc>, HttpErrorJson> {
                 format!("`{name}` is not an RFC 3339 timestamp: {e}"),
             )
         })
+}
+
+/// The name this device records for **itself** in a decision it makes.
+///
+/// ⚠️ **Not `gethostname()`.** The embedded server on Android answers `localhost` on every device,
+/// and `localhost` is the one name that means something different everywhere it is read: a decision
+/// made on the phone saying `device_role: "localhost"` reads on the tablet as *the tablet*. 4.2a hit
+/// this on hardware — the phone left an eight-second tail asking and the tablet settled the same
+/// tail in favour of itself, which is precisely the disagreement **R18** forbids. `apply` was
+/// hardened against acting on it, but a name that lies is still a name that lies: it is written into
+/// every `scope: always` rule's signature, and a rule keyed on `localhost` can never mean the same
+/// thing on two devices.
+///
+/// The real name is already in the database. The Android watcher creates its buckets with the
+/// hostname Kotlin derives from `Settings.Global.DEVICE_NAME` (`DeviceHostname.kt`), which is the
+/// same name a peer reads off the `-synced-from-<peer>` suffix — so both ends of a decision agree.
+/// Read it back from the device's **own** buckets, the ones without that suffix.
+///
+/// `gethostname()` stays as the fallback: on a desktop it is a real name, and on a fresh Android
+/// install with no local buckets yet there is nothing better to say. Disagreeing local buckets fall
+/// back too — several names means we do not know ours, and guessing is how this went wrong before.
+fn own_hostname(state: &ServerState) -> String {
+    let from_buckets = state.datastore.get_buckets().ok().and_then(|buckets| {
+        own_name_from(buckets.iter().map(|(id, b)| (id.as_str(), b.hostname.as_str())))
+    });
+    from_buckets.unwrap_or_else(|| {
+        gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| String::new())
+    })
+}
+
+/// The one name this device's own buckets agree on, if there is one.
+///
+/// `localhost` and `unknown` are discarded rather than returned: both are what a component says
+/// when it does *not* know the name, and neither identifies a device to a peer. Split out from
+/// [`own_hostname`] so the rule can be tested without standing up a datastore.
+fn own_name_from<'a>(buckets: impl Iterator<Item = (&'a str, &'a str)>) -> Option<String> {
+    let mut names: Vec<String> = buckets
+        .filter(|(id, _)| synced_from_hostname(id).is_none())
+        .map(|(_, hostname)| hostname.trim().to_string())
+        .filter(|h| !h.is_empty() && h != "localhost" && h != "unknown")
+        .collect();
+    names.sort_unstable();
+    names.dedup();
+    match names.len() {
+        1 => names.pop(),
+        _ => None,
+    }
 }
 
 /// `GET /api/0/combined/timeline?start=…&end=…&hostnames=…`
@@ -78,11 +129,7 @@ pub fn timeline(
         // caller to get wrong here, so it is deliberately not a parameter.
         own_device: state.device_id.clone(),
         hostname_to_uuid,
-        // Same source `GET /api/0/info` reports, so the name a decision records for this device is
-        // the name everything else already calls it.
-        own_hostname: gethostname::gethostname()
-            .into_string()
-            .unwrap_or_else(|_| String::new()),
+        own_hostname: own_hostname(state),
     };
 
     combined_timeline(&state.datastore, &req)
@@ -111,6 +158,48 @@ mod tests {
         let err = parse_ts("end", "not a date").unwrap_err();
         let msg = serde_json::to_string(&err).unwrap();
         assert!(msg.contains("`end`"), "message should name the parameter: {msg}");
+    }
+
+    #[test]
+    fn own_name_is_what_this_devices_own_watchers_call_it() {
+        // What an S25U's database actually looks like: its own watchers, plus the tablet's buckets
+        // arriving over sync. Only the first kind says anything about who *this* device is.
+        let name = own_name_from(
+            [
+                ("aw-watcher-android-test", "jude_s_s25_ultra"),
+                ("aw-watcher-android-unlock", "jude_s_s25_ultra"),
+                ("aw-watcher-android-test-synced-from-galaxy_tab_s9", "galaxy_tab_s9"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(name.as_deref(), Some("jude_s_s25_ultra"));
+    }
+
+    #[test]
+    fn own_name_refuses_the_names_that_mean_i_do_not_know() {
+        // The bug this function exists for: `localhost` is what the embedded server calls itself on
+        // every Android device, so recording it in a decision makes the phone's answer read on the
+        // tablet as being about the tablet. Better to fall back than to write a name that lies.
+        assert_eq!(own_name_from([("aw-server", "localhost")].into_iter()), None);
+        assert_eq!(own_name_from([("aw-watcher-android-test", "unknown")].into_iter()), None);
+        assert_eq!(own_name_from([("aw-watcher-android-test", "  ")].into_iter()), None);
+    }
+
+    #[test]
+    fn own_name_does_not_guess_when_its_own_buckets_disagree() {
+        let name = own_name_from(
+            [
+                ("aw-watcher-android-test", "jude_s_s25_ultra"),
+                ("aw-stopwatch", "an_older_name"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(name, None);
+    }
+
+    #[test]
+    fn own_name_is_none_before_any_watcher_has_run() {
+        assert_eq!(own_name_from([].into_iter()), None);
     }
 }
 
