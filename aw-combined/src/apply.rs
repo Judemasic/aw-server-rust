@@ -6,7 +6,7 @@
 //!
 //! Two passes, in this order (§2.3):
 //!
-//! 1. **Exact** — a decision whose window covers this segment and whose signature matches it.
+//! 1. **Exact** — a `scope: once` decision whose window covers this segment and which can act on it.
 //! 2. **Rule** — a `scope: always` decision whose signature matches, wherever it was recorded.
 //!
 //! Exact beats rule, so a one-off correction overrides a standing rule without deleting it. A
@@ -17,17 +17,41 @@
 //! resolves a *coalesced* block — a run of atomic segments. Requiring the window to equal the
 //! segment would therefore match nothing at all. Covering is the reading that makes the recorded
 //! window mean what the owner saw when they answered.
+//!
+//! **A windowed decision answers a stretch of time, not a cast of competitors** (roadmap 4.2a).
+//! Until 4.2a a `once` decision also had to match the segment's signature exactly, which was wrong
+//! in the case the owner meets most: `coalesce` glues neighbouring segments together whenever the
+//! *winner* is unchanged, so a block on screen routinely contains several different casts. The
+//! sheet reads its cast off the glued block, and a three-way cast matches none of the two-way
+//! segments underneath — so the answer landed nowhere, silently, and every overlap where a device
+//! switched app part-way through was unresolvable.
+//!
+//! The signature stays what a **rule** matches on: "whenever *these* things compete, X wins" really
+//! is a statement about the cast. A `once` decision is a statement about the time.
+//!
+//! **And it can only settle time where the thing it picked was running.** A `foreground` pick names
+//! one competitor; where that competitor is absent the owner has answered nothing, and the segment
+//! goes on asking. The alternative — settling it anyway and letting ⑤ choose a winner — credits an
+//! activity with time no watcher ever recorded, which is what **R11** forbids. `ignore` and
+//! `relabel` name the *time* rather than a competitor, so those two do cover the whole window.
 
 use std::collections::HashMap;
 
-use crate::decision::{Decision, Participant, Signature, OUTCOME_FOREGROUND, OUTCOME_IGNORE, OUTCOME_RELABEL};
+use crate::decision::{
+    Decision, ForegroundPick, Participant, Signature, OUTCOME_FOREGROUND, OUTCOME_IGNORE,
+    OUTCOME_RELABEL,
+};
 use crate::{activity_label, Segment, SegmentState};
 
 /// Apply every decision that matches, to every segment it matches.
 ///
 /// `roles` maps device uuid -> the role name a signature uses. See [`crate::PipelineInput`]: today
 /// that is the device's hostname, which is what the recording device wrote.
-pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &HashMap<String, String>) {
+pub(crate) fn apply(
+    segments: &mut [Segment],
+    decisions: &[Decision],
+    roles: &HashMap<String, String>,
+) {
     if decisions.is_empty() {
         return;
     }
@@ -45,18 +69,24 @@ pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &Ha
     }
 
     for seg in segments.iter_mut() {
-        let keys = segment_match_keys(seg, roles);
-
         // Pass 1: the narrowest thing there is — a decision recorded over this very time.
         let mut exact: Option<&Decision> = None;
         for decision in decisions {
-            if !keys.contains(&decision.signature.match_key()) {
+            // `once` only. A rule's window records where the owner *was* when they made it, not
+            // what it applies to, and since 4.2a the windowed pass no longer checks the cast — so
+            // letting a rule through here would settle whatever else happened to share that clock.
+            // A rule still settles the block it was made on, through the pass below, where its cast
+            // matches by construction and the view can say a rule did it (**R16**).
+            if decision.is_rule() {
                 continue;
             }
             let Some((start, end)) = decision.window_bounds() else {
                 continue;
             };
             if start > seg.start || end < seg.end {
+                continue;
+            }
+            if !can_act_on(seg, decision, roles) {
                 continue;
             }
             // Two different windows can both cover one segment (a rule recorded over an hour, a
@@ -70,16 +100,62 @@ pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &Ha
 
         let (decision, by_rule) = match exact {
             Some(d) => (d, false),
-            None => match keys.iter().find_map(|k| best_rule.get(k)) {
-                Some(d) => (*d, true),
-                None => continue,
-            },
+            None => {
+                let keys = segment_match_keys(seg, roles);
+                match keys
+                    .iter()
+                    .find_map(|k| best_rule.get(k))
+                    .filter(|d| can_act_on(seg, d, roles))
+                {
+                    Some(d) => (*d, true),
+                    None => continue,
+                }
+            }
         };
         resolve(seg, decision, by_rule, roles);
     }
 }
 
-/// Every signature key this segment could have been recorded under.
+/// Whether this decision has anything to say about this segment.
+///
+/// A `foreground` pick can only settle a segment the picked activity is actually part of; see the
+/// module note. An outcome this build does not recognise says nothing about any segment — §8 says
+/// ignore what we do not understand — and it must not consume precedence over a rule that *is*
+/// understood, either.
+fn can_act_on(seg: &Segment, decision: &Decision, roles: &HashMap<String, String>) -> bool {
+    match decision.resolution.outcome.as_str() {
+        OUTCOME_FOREGROUND => decision
+            .resolution
+            .foreground
+            .as_ref()
+            .and_then(|pick| pick_index(seg, pick, roles))
+            .is_some(),
+        OUTCOME_RELABEL | OUTCOME_IGNORE => true,
+        _ => false,
+    }
+}
+
+/// Where the picked activity sits among this segment's slices, if it is here at all.
+///
+/// uuid first, role second: a decision synced from a peer names the device it saw, and a rule that
+/// outlived a replaced device only has the role left.
+fn pick_index(
+    seg: &Segment,
+    pick: &ForegroundPick,
+    roles: &HashMap<String, String>,
+) -> Option<usize> {
+    seg.active
+        .iter()
+        .position(|s| s.device == pick.device_uuid && activity_label(&s.data) == pick.app)
+        .or_else(|| {
+            seg.active.iter().position(|s| {
+                role_of(&s.device, roles) == pick.device_role && activity_label(&s.data) == pick.app
+            })
+        })
+}
+
+/// Every signature key this segment could have been recorded under. **Rules only** — a windowed
+/// decision no longer matches on the cast (see the module note).
 ///
 /// Normally one: the participants, canonically ordered, with the same fields the sheet writes.
 ///
@@ -131,37 +207,17 @@ fn role_of(uuid: &str, roles: &HashMap<String, String>) -> String {
     roles.get(uuid).cloned().unwrap_or_else(|| uuid.to_string())
 }
 
-/// Carry one decision onto one segment.
-///
-/// An outcome this build does not recognise resolves **nothing**: §8 says ignore what we do not
-/// understand, and quietly settling a segment on the strength of a word we cannot read would hide
-/// an open question rather than answer it.
+/// Carry one decision onto one segment. Only ever reached after [`can_act_on`] said yes.
 fn resolve(seg: &mut Segment, decision: &Decision, by_rule: bool, roles: &HashMap<String, String>) {
     match decision.resolution.outcome.as_str() {
         OUTCOME_FOREGROUND => {
             let Some(pick) = decision.resolution.foreground.as_ref() else {
                 return; // a `foreground` outcome with nothing picked is not an answer
             };
-            // uuid first, role second: a decision synced from a peer names the device it saw, and a
-            // rule that outlived a replaced device only has the role left.
-            let index = seg
-                .active
-                .iter()
-                .position(|s| s.device == pick.device_uuid && activity_label(&s.data) == pick.app)
-                .or_else(|| {
-                    seg.active.iter().position(|s| {
-                        role_of(&s.device, roles) == pick.device_role
-                            && activity_label(&s.data) == pick.app
-                    })
-                });
-            match index {
-                Some(i) => seg.foreground = i,
-                // The picked activity is not in this segment. That is possible for a rule matched
-                // on a signature whose apps are present but whose *pick* names a device no longer
-                // here. Leave the winner to ⑤ rather than crediting the wrong slice, but still
-                // record that the question was answered.
-                None => {}
-            }
+            let Some(i) = pick_index(seg, pick, roles) else {
+                return; // not running here; `can_act_on` has already kept us out of this case
+            };
+            seg.foreground = i;
         }
         OUTCOME_RELABEL => {
             seg.label_override = decision.resolution.label.clone();
