@@ -88,7 +88,7 @@ fn own_name_from<'a>(buckets: impl Iterator<Item = (&'a str, &'a str)>) -> Optio
     }
 }
 
-/// `GET /api/0/combined/timeline?start=…&end=…&hostnames=…`
+/// `GET /api/0/combined/timeline?start=…&end=…&hostnames=…&sliver=…`
 ///
 /// `hostnames` is an optional JSON object mapping a peer's hostname to its device uuid. It exists
 /// only as a **fallback**: [`aw_combined::resolve_bucket_device`] prefers the `$aw.origin.device`
@@ -96,11 +96,17 @@ fn own_name_from<'a>(buckets: impl Iterator<Item = (&'a str, &'a str)>) -> Optio
 /// the bucket id for databases holding pre-3.1 events. On Android the real map lives in the
 /// Syncthing folder behind SAF, which only Kotlin can open — hence a parameter rather than a read.
 /// Omitted, an untagged peer bucket shows its hostname where a uuid would go, which is legible.
-#[get("/timeline?<start>&<end>&<hostnames>")]
+///
+/// `sliver` is roadmap 4.5's smoothing threshold in seconds — how short a stretch has to be before
+/// it stops being its own block. Omitted it is 15s; `0` is off, and the day is drawn literally.
+/// A query parameter and not a stored setting on purpose: smoothing is a *view* transform, so the
+/// number arrives with the request and the day recomputes, with nothing written either way.
+#[get("/timeline?<start>&<end>&<hostnames>&<sliver>")]
 pub fn timeline(
     start: String,
     end: String,
     hostnames: Option<String>,
+    sliver: Option<i64>,
     state: &State<ServerState>,
 ) -> Result<Value, HttpErrorJson> {
     let start = parse_ts("start", &start)?;
@@ -130,6 +136,10 @@ pub fn timeline(
         own_device: state.device_id.clone(),
         hostname_to_uuid,
         own_hostname: own_hostname(state),
+        // Clamped rather than rejected: a bad number here cannot corrupt anything -- nothing is
+        // written -- and refusing the whole day over a display preference would be the worse
+        // failure. An hour is far past any threshold that still means "sliver".
+        sliver_secs: sliver.map(|s| s.clamp(0, 3600)),
     };
 
     combined_timeline(&state.datastore, &req)

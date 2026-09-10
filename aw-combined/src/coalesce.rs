@@ -23,6 +23,10 @@ use crate::{ActiveSlice, Segment};
 /// - every field ④ writes is equal — same decision id, same rule flag, same relabel, same
 ///   `ignored`, same deliberate-background set.
 ///
+/// ⑦'s smoothing bookkeeping (`smoothed_seconds`, `absorbed_labels`) is **not** compared: it is a
+/// footnote about what was rounded away, and two otherwise-identical stretches must not be held
+/// apart by one. The merged segment sums the seconds and unions the labels.
+///
 /// The merged segment takes `start` from `prev`, `end` from `next`, carries the flags over, and its
 /// `active` is the union of both slice lists deduplicated by `(device, bucket_id, data)` and
 /// re-sorted by `(device, bucket_id)`. A slice present in both with different source spans is kept
@@ -67,6 +71,17 @@ fn key(s: &ActiveSlice) -> (&str, &str, &serde_json::Map<String, serde_json::Val
 fn merge_into(prev: &mut Segment, next: Segment) {
     // Remember which slice was foreground so we can find it again after the union is rebuilt.
     let fg = prev.foreground_slice().clone();
+
+    // ⑦'s bookkeeping is additive, not an identity: two blocks that each swallowed a crumb are
+    // still mergeable, and the merged block swallowed both. Deliberately not part of `mergeable`
+    // for that reason -- comparing them would keep two identical stretches apart over a footnote.
+    prev.smoothed_seconds += next.smoothed_seconds;
+    for l in next.absorbed_labels {
+        if !prev.absorbed_labels.contains(&l) {
+            prev.absorbed_labels.push(l);
+        }
+    }
+    prev.absorbed_labels.sort();
 
     let mut active = std::mem::take(&mut prev.active);
     for s in next.active {

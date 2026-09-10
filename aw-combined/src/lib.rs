@@ -33,10 +33,12 @@ mod coalesce;
 pub mod decision;
 mod normalise;
 mod segment;
+mod smooth;
 
 pub use coalesce::coalesce;
 pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
 pub use normalise::{resolve_bucket_device, synced_from_hostname};
+pub use smooth::{smooth, SmoothOptions, DEFAULT_SLIVER_SECS, NOISE_FLOOR_SECS};
 
 pub use aw_models::EVENT_ORIGIN_KEY;
 
@@ -167,6 +169,14 @@ pub struct Segment {
     /// Apps the owner ticked as deliberately running alongside the winner. Kept for the day view
     /// (**R6** still means one foreground) and for the rules engine R15 builds on this data.
     pub deliberate_background: Vec<String>,
+    /// Seconds folded into this block from slivers ⑦ [`smooth`] rounded away (roadmap 4.5). Zero
+    /// when nothing was. The seconds still *count* — the block's span grew to cover them — this is
+    /// only how many of them came from somewhere else.
+    pub smoothed_seconds: i64,
+    /// The distinct labels of those slivers, sorted, excluding this block's own. Empty when nothing
+    /// was rounded away. Kept so the view can say what was smoothed rather than let it vanish:
+    /// rounding is a display setting, and a display setting that hides things silently is a lie.
+    pub absorbed_labels: Vec<String>,
 }
 
 impl Segment {

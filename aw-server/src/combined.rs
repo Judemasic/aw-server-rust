@@ -19,7 +19,8 @@ use serde_json::{json, Map, Value};
 
 use aw_combined::{
     activity_label, coalesce, compute_segments, default_min_contention, merge_decisions, parse_line,
-    resolve_bucket_device, synced_from_hostname, BucketEvents, PipelineInput, Segment, SharedRecord,
+    resolve_bucket_device, smooth, synced_from_hostname, BucketEvents, PipelineInput, Segment,
+    SharedRecord, SmoothOptions,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -51,6 +52,11 @@ pub struct TimelineRequest {
     /// `-synced-from-<peer>` suffix in its bucket ids. Without it the one device whose events carry
     /// no suffix — this one — would be the only one left showing a uuid.
     pub own_hostname: String,
+    /// Roadmap 4.5 — the sliver threshold ⑦ smooths at, in seconds. `None` uses the default (15s);
+    /// `Some(0)` is "off", which means literal. A **display** setting and therefore a per-request
+    /// parameter rather than stored state: change the number and the day recomputes from the same
+    /// events and the same decisions, with nothing written and nothing lost.
+    pub sliver_secs: Option<i64>,
 }
 
 /// A human label for one event's `data`, for a track row.
@@ -214,7 +220,12 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     // exactly the same rule (R19) the pipeline uses.
     let devices = device_tracks(&input);
 
-    let segments = coalesce(compute_segments(input.clone()));
+    // ⑥ then ⑦: coalesce glues identical neighbours, smoothing rounds away what is left over.
+    // Both are presentation, both are recomputed on every read, and neither touches the datastore.
+    let segments = smooth(
+        coalesce(compute_segments(input.clone())),
+        SmoothOptions::from_sliver_secs(req.sliver_secs.unwrap_or(aw_combined::DEFAULT_SLIVER_SECS)),
+    );
     // Time the owner said was nobody's counts toward nothing — that is what "I was away" means.
     let combined_seconds: i64 = segments
         .iter()
@@ -250,6 +261,9 @@ fn combined_row(seg: &Segment) -> Value {
         "ignored": seg.ignored,
         "relabelled": seg.label_override.is_some(),
         "deliberate_background": seg.deliberate_background,
+        // Roadmap 4.5. What ⑦ rounded into this block, so the view can say so.
+        "smoothed_seconds": seg.smoothed_seconds,
+        "absorbed_labels": seg.absorbed_labels,
         "background": seg
             .background_slices()
             .map(|s| json!({ "device": s.device, "label": label(&s.data) }))

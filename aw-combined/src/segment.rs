@@ -64,6 +64,8 @@ pub(crate) fn segment(intervals: &[Interval]) -> Vec<Segment> {
             label_override: None,   // set by ④
             ignored: false,         // set by ④
             deliberate_background: Vec::new(), // set by ④
+            smoothed_seconds: 0,               // set by ⑦
+            absorbed_labels: Vec::new(),       // set by ⑦
         });
     }
     segments
