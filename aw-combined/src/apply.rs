@@ -139,19 +139,36 @@ fn can_act_on(seg: &Segment, decision: &Decision, roles: &HashMap<String, String
 ///
 /// uuid first, role second: a decision synced from a peer names the device it saw, and a rule that
 /// outlived a replaced device only has the role left.
+///
+/// ⚠️ **The role is only consulted for a device we have never heard of.** Every Android device
+/// reports its own hostname as `localhost` (`gethostname()` on the embedded server), so a peer's
+/// decision names *itself* `localhost` — the one string that means a different device on every
+/// machine it is read on. Falling back on it whenever the uuid missed made a peer credit **its own**
+/// activity with the owner's pick, and the two devices then disagreed about the same seconds, which
+/// is exactly what **R18** forbids. Found on hardware in 4.2a: the S25U left an 8-second tail
+/// asking, the tablet settled the same tail in favour of itself.
+///
+/// A device we know about and simply cannot find in this segment is an answer of "not here", not a
+/// reason to guess. The fallback goes on existing for the case it was written for — a rule that
+/// outlived the device that made it, whose uuid nothing in this day has ever seen.
 fn pick_index(
     seg: &Segment,
     pick: &ForegroundPick,
     roles: &HashMap<String, String>,
 ) -> Option<usize> {
-    seg.active
+    if let Some(i) = seg
+        .active
         .iter()
         .position(|s| s.device == pick.device_uuid && activity_label(&s.data) == pick.app)
-        .or_else(|| {
-            seg.active.iter().position(|s| {
-                role_of(&s.device, roles) == pick.device_role && activity_label(&s.data) == pick.app
-            })
-        })
+    {
+        return Some(i);
+    }
+    if roles.contains_key(&pick.device_uuid) {
+        return None; // a device this day knows; it is simply not in this segment
+    }
+    seg.active.iter().position(|s| {
+        role_of(&s.device, roles) == pick.device_role && activity_label(&s.data) == pick.app
+    })
 }
 
 /// Every signature key this segment could have been recorded under. **Rules only** — a windowed

@@ -284,3 +284,113 @@ fn a_rule_whose_pick_is_absent_resolves_nothing() {
     assert!(segs[0].resolved_by.is_none(), "{segs:#?}");
     assert!(segs[0].unresolved);
 }
+
+/// Found on hardware, 2026-09-10: every Android device calls itself `localhost`, so a peer's
+/// decision names *itself* by the one role string that means something different on every machine.
+///
+/// The S25U left an 8-second tail asking because its own ActivityWatch had stopped; the Tab S10 FE
+/// read the same record, missed on the uuid, fell back to the role, matched **its own**
+/// ActivityWatch and settled the tail in favour of itself. Two devices, one day, two answers —
+/// which **R18** forbids.
+#[test]
+fn a_peers_pick_never_matches_the_device_reading_it() {
+    // Both devices are called `localhost` by themselves, which is what `gethostname()` returns on
+    // Android. The tablet is the one reading, so it is `localhost` here.
+    let mut roles = HashMap::new();
+    roles.insert("localhost".to_string(), TABLET.to_string());
+    roles.insert("jude-phone".to_string(), PHONE.to_string());
+
+    // The phone's decision about its own ActivityWatch, written as the phone writes it.
+    let record = json!({
+        "id": "d_1",
+        "type": "decision",
+        "created_at": "2026-09-10T12:00:00Z",
+        "created_by": PHONE,
+        "window": { "start": t(0).to_rfc3339(), "end": t(60).to_rfc3339() },
+        "signature": { "participants": [
+            { "device_role": "localhost", "device_uuid": PHONE, "app": "ActivityWatch", "category": null },
+        ]},
+        "resolution": {
+            "outcome": "foreground",
+            // `localhost` here means the phone. On the tablet it names the tablet.
+            "foreground": { "device_role": "localhost", "device_uuid": PHONE, "app": "ActivityWatch" },
+            "label": null,
+            "deliberate_background": [],
+        },
+        "scope": "once",
+    })
+    .to_string();
+
+    // The tablet's day: its own ActivityWatch against the phone's launcher. The phone's
+    // ActivityWatch — the thing the decision picked — is not running.
+    let input = PipelineInput {
+        own_device: TABLET.to_string(),
+        hostname_to_uuid: roles,
+        activity: vec![
+            BucketEvents {
+                bucket_id: "aw-watcher-window_tablet".to_string(),
+                events: vec![tagged(0, 60, TABLET, "ActivityWatch")],
+            },
+            BucketEvents {
+                bucket_id: "aw-watcher-window_phone".to_string(),
+                events: vec![tagged(0, 60, PHONE, "One UI Home")],
+            },
+        ],
+        idle: vec![],
+        min_contention: default_min_contention(),
+        decisions: merge_decisions(&parse_records(&record)),
+    };
+    let segs = coalesce(compute_segments(input));
+
+    assert_eq!(segs.len(), 1);
+    assert!(
+        segs[0].resolved_by.is_none(),
+        "the pick names the phone, which is not running it here: {segs:#?}"
+    );
+    assert!(segs[0].unresolved, "so the tablet goes on asking, exactly as the phone does");
+    assert_ne!(
+        segs[0].foreground_slice().device,
+        TABLET.to_string(),
+        "and above all the tablet must not credit itself with the owner's pick"
+    );
+}
+
+/// The fallback still exists for the case it was written for: a rule that outlived the device that
+/// made it, whose uuid nothing in this day has ever seen.
+#[test]
+fn a_role_still_finds_a_device_this_day_has_never_heard_of() {
+    let record = json!({
+        "id": "d_1",
+        "type": "decision",
+        "created_at": "2026-09-10T12:00:00Z",
+        "created_by": "99999999-9999-9999-9999-999999999999",
+        "window": { "start": t(0).to_rfc3339(), "end": t(60).to_rfc3339() },
+        "signature": { "participants": [
+            { "device_role": "jude-tablet", "device_uuid": TABLET, "app": "YouTube", "category": null },
+        ]},
+        "resolution": {
+            "outcome": "foreground",
+            // A uuid this day has never seen — a replaced device — but the role still names it.
+            "foreground": {
+                "device_role": "jude-tablet",
+                "device_uuid": "deadbeef-0000-0000-0000-000000000000",
+                "app": "YouTube",
+            },
+            "label": null,
+            "deliberate_background": [],
+        },
+        "scope": "once",
+    })
+    .to_string();
+
+    let segs = day(
+        vec![tagged(0, 60, PHONE, "Game")],
+        vec![tagged(0, 60, TABLET, "YouTube")],
+        &[record],
+    );
+
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].resolved_by.as_deref(), Some("d_1"), "{segs:#?}");
+    assert_eq!(segs[0].foreground_slice().device, TABLET);
+    assert_eq!(label(&segs[0]), "YouTube");
+}
