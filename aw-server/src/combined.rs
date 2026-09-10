@@ -227,11 +227,14 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         SmoothOptions::from_sliver_secs(req.sliver_secs.unwrap_or(aw_combined::DEFAULT_SLIVER_SECS)),
     );
     // Time the owner said was nobody's counts toward nothing — that is what "I was away" means.
+    // Summed as durations and truncated **once**. Per-block `seconds` truncates per block, so
+    // adding those up loses a second every time smoothing joins two blocks whose sub-second parts
+    // both round down -- which showed up as the day's total shrinking by 1s at a 60s threshold.
     let combined_seconds: i64 = segments
         .iter()
         .filter(|s| !s.ignored)
-        .map(|s| (s.end - s.start).num_seconds())
-        .sum();
+        .fold(chrono::Duration::zero(), |acc, s| acc + (s.end - s.start))
+        .num_seconds();
 
     Ok(json!({
         "start": req.start,

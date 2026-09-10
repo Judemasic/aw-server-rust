@@ -29,7 +29,9 @@
 //!    any size, so one answer never draws as three blocks.
 //! 7. **Absorb by a total order, not by scan direction.** A run of consecutive slivers is resolved
 //!    shortest-first, ties broken by label then device then start — so the result does not depend
-//!    on which end the list is read from (**R18**).
+//!    on which end the list is read from (**R18**). A sliver always joins its **longer** neighbour,
+//!    whichever rule admitted it, which is what makes raising the threshold monotone: a bigger
+//!    number can only ever absorb more. See [`target_for`] for the day that proved it matters.
 //! 8. **Off means literal.** A threshold of zero disables 3 and 6; only the noise floor survives.
 //!
 //! Rule 4 of the roadmap's list — *transit apps*, `A, Home, B` absorbing forward into `B` — is
@@ -138,39 +140,57 @@ fn longer(segs: &[Segment], prev: Option<usize>, next: Option<usize>) -> Option<
     }
 }
 
-/// Where segment `i` should go, if anywhere.
-fn target_for(segs: &[Segment], i: usize, opts: &SmoothOptions) -> Option<usize> {
+/// Is segment `i` allowed to disappear into a neighbour at all?
+///
+/// This is the whole of the rule set. **Where** it goes is a separate question, answered by
+/// [`longer`] and never by which rule said yes — see the note there.
+fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions, bracketed: bool) -> bool {
     let seg = &segs[i];
-    let prev = prev_of(segs, i);
-    let next = next_of(segs, i);
 
     // Rule 6 — inside one decision's window, at any size. `joinable` has already established that
     // a neighbour reached here carries the *same* decision id, so this can never merge two answers.
     if !opts.sliver.is_zero() && seg.resolved_by.is_some() {
-        return longer(segs, prev, next);
+        return true;
     }
 
     let dur = span(seg);
 
-    // Rule 3 — the bracket. Same device and same label on both sides is what "went and came back"
-    // means; anything less is rule 5's ambiguous case.
-    if !opts.sliver.is_zero() && dur < opts.sliver {
-        if let (Some(p), Some(n)) = (prev, next) {
-            let (a, b) = (&segs[p], &segs[n]);
-            if a.foreground_slice().device == b.foreground_slice().device
-                && label_of(a) == label_of(b)
-            {
-                return Some(p);
-            }
-        }
-    }
-
     // Rule 2 — the noise floor. No bracket needed: this is not a preference, it is jitter.
     if dur < opts.noise_floor {
-        return longer(segs, prev, next);
+        return true;
     }
 
-    None // rule 5: literal
+    // Rule 3 — went and came back. Rule 5 is the `else`: short, unbracketed, and left literal.
+    !opts.sliver.is_zero() && dur < opts.sliver && bracketed
+}
+
+/// Where segment `i` should go, if anywhere.
+///
+/// **The target never depends on which rule admitted the segment**, and that is not a detail. It
+/// was, once: rule 3 returned `prev` because `A, B, A` reads as "B belongs to the A before it".
+/// Measured on the owner's real day, that made the whole transform non-monotone — raising the
+/// threshold from 0 to 5s produced *more* blocks, because a crumb that had been joining its longer
+/// neighbour started joining its shorter one, and the merge that used to follow downstream no
+/// longer did. A threshold that can make the day more shattered by being raised is not a setting
+/// anyone can reason about. Both neighbours carry the same label whenever rule 3 fires, so joining
+/// the longer one says exactly the same thing about the day and keeps the guarantee: raising the
+/// number can only ever absorb more.
+fn target_for(segs: &[Segment], i: usize, opts: &SmoothOptions) -> Option<usize> {
+    let prev = prev_of(segs, i);
+    let next = next_of(segs, i);
+
+    let bracketed = match (prev, next) {
+        (Some(p), Some(n)) => {
+            let (a, b) = (&segs[p], &segs[n]);
+            a.foreground_slice().device == b.foreground_slice().device && label_of(a) == label_of(b)
+        }
+        _ => false,
+    };
+
+    if !absorbable(segs, i, opts, bracketed) {
+        return None;
+    }
+    longer(segs, prev, next)
 }
 
 /// The single best absorption to do next, by rule 7's total order: shortest first, then label, then
