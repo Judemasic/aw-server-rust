@@ -18,8 +18,8 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 use aw_combined::{
-    coalesce, compute_segments, default_min_contention, resolve_bucket_device, BucketEvents,
-    PipelineInput, Segment,
+    activity_label, coalesce, compute_segments, default_min_contention, merge_decisions, parse_line,
+    resolve_bucket_device, BucketEvents, PipelineInput, Segment, SharedRecord,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -49,16 +49,72 @@ pub struct TimelineRequest {
     pub hostname_to_uuid: HashMap<String, String>,
 }
 
-/// A human label for one event's `data`, for a track row. Falls back rather than failing (**R19**).
+/// A human label for one event's `data`, for a track row.
+///
+/// Thin wrapper on [`aw_combined::activity_label`]: step ④ has to reproduce this string exactly to
+/// match a decision's signature against a segment, so the definition lives in the pipeline crate and
+/// this module borrows it rather than keeping a second copy that could drift.
 fn label(data: &Map<String, Value>) -> String {
-    for key in ["app", "title", "url"] {
-        if let Some(Value::String(s)) = data.get(key) {
-            if !s.is_empty() {
-                return s.clone();
-            }
-        }
+    activity_label(data)
+}
+
+/// Datastore key prefix for the owner's decisions and tombstones (roadmap 4.2).
+///
+/// **Why the key-value store and not a file.** The canonical, cross-device copy of a decision is a
+/// line in `decisions.jsonl` in the Syncthing folder, which on Android only Kotlin can open (SAF).
+/// The server therefore keeps its own copy in the datastore and Kotlin carries lines both ways at
+/// sync time — exactly the shape the settings sync already has (roadmap 2.3), for exactly the same
+/// reason. On a desktop, where there is no shared folder, the datastore copy simply *is* the store.
+///
+/// Values are stored in **one canonical spelling**: the record's JSON with its keys sorted, which
+/// is what `serde_json` produces here (its `Map` is a `BTreeMap` — no `preserve_order` feature).
+/// Storing whatever bytes arrived was the first design, and it was worse: a decision made on the
+/// phone and the same decision arriving from the tablet would sit in the two devices' files spelled
+/// two ways. The merge keys on `id` and would not care, but every dump of the file, every diff and
+/// any future byte-level compaction would. One normal form, applied on the way in, and both devices
+/// hold the same line. Unknown fields survive it — §8 — because nothing is parsed into a struct.
+pub const DECISION_KEY_PREFIX: &str = "combined.decision.";
+
+/// Every decision and tombstone this device holds, parsed.
+///
+/// Keys are visited in sorted order so the list is stable (**R18**) — though the merge itself is
+/// order-independent by construction, so this is belt and braces.
+pub fn stored_records(ds: &Datastore) -> Result<Vec<SharedRecord>, String> {
+    let stored = ds
+        .get_key_values(&format!("{DECISION_KEY_PREFIX}%"))
+        .map_err(|e| format!("could not read decisions: {e:?}"))?;
+    let mut keys: Vec<&String> = stored.keys().collect();
+    keys.sort();
+    Ok(keys
+        .into_iter()
+        .filter_map(|k| parse_line(&stored[k]))
+        .collect())
+}
+
+/// Store one decision or tombstone, keyed by its id. Returns the id.
+///
+/// Idempotent: the same record written twice overwrites itself, which is what makes the sync's
+/// "import everything the shared folder has" pass cheap and safe to repeat.
+pub fn store_record(ds: &Datastore, raw: &str) -> Result<String, String> {
+    let id = match parse_line(raw) {
+        Some(SharedRecord::Decision(d)) => d.id,
+        Some(SharedRecord::Tombstone(t)) => t.id,
+        _ => return Err("not a decision or tombstone record".to_string()),
+    };
+    let canonical = serde_json::from_str::<Value>(raw)
+        .map(|v| v.to_string())
+        .map_err(|e| format!("{id} is not JSON: {e}"))?;
+    // The id becomes part of a datastore key, and a ULID is `[0-9A-Z]` after a short prefix. Refuse
+    // anything else rather than let a crafted id reach out of this key space.
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(format!("`id` has characters that cannot be a key: {id}"));
     }
-    "(unknown)".to_string()
+    ds.set_key_value(&format!("{DECISION_KEY_PREFIX}{id}"), &canonical)
+        .map_err(|e| format!("could not store {id}: {e:?}"))?;
+    Ok(id)
 }
 
 /// True for an event that represents an *idle* period, per `aw-combined`'s idle contract.
@@ -110,6 +166,9 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         // D15/Q1's default. Not a setting yet — nothing in the app exposes one, and 3.4 is about
         // seeing the track at all. Wire it to a preference when Phase 4 gives it a home.
         min_contention: default_min_contention(),
+        // ④'s input. Merged here rather than stored merged, because the merge's answer changes
+        // whenever a peer's file arrives, and a stored answer would go stale silently (R18).
+        decisions: merge_decisions(&stored_records(ds)?),
     };
 
     // Per-device tracks are built from the *raw* events, before idle subtraction and before
@@ -119,8 +178,10 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     let devices = device_tracks(&input);
 
     let segments = coalesce(compute_segments(input.clone()));
+    // Time the owner said was nobody's counts toward nothing — that is what "I was away" means.
     let combined_seconds: i64 = segments
         .iter()
+        .filter(|s| !s.ignored)
         .map(|s| (s.end - s.start).num_seconds())
         .sum();
 
@@ -141,11 +202,17 @@ fn combined_row(seg: &Segment) -> Value {
         "start": seg.start,
         "end": seg.end,
         "seconds": (seg.end - seg.start).num_seconds(),
-        "label": label(&fg.data),
+        // The owner's own words win over the app name when they gave any (`outcome: relabel`).
+        "label": seg.label_override.clone().unwrap_or_else(|| label(&fg.data)),
         "device": fg.device,
         "state": seg.state,
         "unresolved": seg.unresolved,
         "absorbed_short_contention": seg.absorbed_short_contention,
+        "resolved_by": seg.resolved_by,
+        "auto_resolved": seg.auto_resolved,
+        "ignored": seg.ignored,
+        "relabelled": seg.label_override.is_some(),
+        "deliberate_background": seg.deliberate_background,
         "background": seg
             .background_slices()
             .map(|s| json!({ "device": s.device, "label": label(&s.data) }))

@@ -19,7 +19,9 @@ use crate::{ActiveSlice, Segment};
 ///   would merge nothing, because heartbeat-split events carry different source spans);
 /// - `prev.state == next.state`;
 /// - `prev.unresolved == next.unresolved`;
-/// - `prev.absorbed_short_contention == next.absorbed_short_contention`.
+/// - `prev.absorbed_short_contention == next.absorbed_short_contention`;
+/// - every field ④ writes is equal — same decision id, same rule flag, same relabel, same
+///   `ignored`, same deliberate-background set.
 ///
 /// The merged segment takes `start` from `prev`, `end` from `next`, carries the flags over, and its
 /// `active` is the union of both slice lists deduplicated by `(device, bucket_id, data)` and
@@ -43,6 +45,14 @@ fn mergeable(prev: &Segment, next: &Segment) -> bool {
         && prev.state == next.state
         && prev.unresolved == next.unresolved
         && prev.absorbed_short_contention == next.absorbed_short_contention
+        // Two stretches the owner answered separately stay separate, even when the same activity
+        // won both: the view names the decision that settled a block, and merging them would put
+        // one id on time the other decision covers.
+        && prev.resolved_by == next.resolved_by
+        && prev.auto_resolved == next.auto_resolved
+        && prev.label_override == next.label_override
+        && prev.ignored == next.ignored
+        && prev.deliberate_background == next.deliberate_background
         && {
             let (p, n) = (prev.foreground_slice(), next.foreground_slice());
             p.device == n.device && p.data == n.data

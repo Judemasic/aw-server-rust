@@ -1013,6 +1013,18 @@ impl DatastoreInstance {
             };
 
         let mut output = HashMap::<String, String>::new();
+        // The guard below used to be the literal string "settings.", which silently made this
+        // function unusable for anything else -- a caller storing under its own prefix could write
+        // rows it could never read back (roadmap 4.2 lost an afternoon to exactly that). Taking the
+        // prefix from the caller's own pattern keeps the guard doing its real job, which is to
+        // refuse a read of the whole table, while letting a second namespace exist. `settings.%`
+        // yields `settings.`, so the settings endpoints behave exactly as before.
+        let prefix = pattern.split('%').next().unwrap_or("");
+        if prefix.is_empty() {
+            return Err(DatastoreError::InternalError(
+                "a key-value pattern must start with a literal prefix".to_string(),
+            ));
+        }
         // Rusqlite's get wants index and item type as parameters.
         let result = stmt.query_map([pattern], |row| {
             Ok((row.get::<usize, String>(0)?, row.get::<usize, String>(1)?))
@@ -1023,8 +1035,7 @@ impl DatastoreInstance {
                     // Unwrap to String or panic on SQL row if type is invalid. Can't happen with a
                     // properly initialized table.
                     let (key, value) = row.unwrap();
-                    // Only return keys starting with "settings.".
-                    if !key.starts_with("settings.") {
+                    if !key.starts_with(prefix) {
                         continue;
                     }
                     output.insert(key, value);

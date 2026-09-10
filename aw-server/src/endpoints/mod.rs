@@ -189,7 +189,15 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
             ],
         )
         .mount("/api/0/query", routes![query::query])
-        .mount("/api/0/combined", routes![combined::timeline])
+        .mount(
+            "/api/0/combined",
+            routes![
+                combined::timeline,
+                combined::decisions_get,
+                combined::decisions_post,
+                combined::decisions_effective
+            ],
+        )
         .mount(
             "/api/0/import",
             routes![import::bucket_import_json, import::bucket_import_form],

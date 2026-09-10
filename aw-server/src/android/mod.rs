@@ -378,6 +378,73 @@ pub mod android {
         }
     }
 
+    /// Every decision and tombstone this device holds, as a JSON array of the stored lines
+    /// (roadmap 4.2).
+    ///
+    /// The lines, not re-serialised records, for the reason `getSettings` gives about setting
+    /// values: the sync copies these into `decisions.jsonl` in the Syncthing folder, and Kotlin
+    /// rebuilding them through `JSONObject` would spell them a third way. Storage already put them
+    /// in one canonical form (`crate::combined::store_record`), so what leaves here is what every
+    /// device holding this decision holds.
+    ///
+    /// JNI rather than HTTP for the same reason as the settings pair: API-key auth is on by default
+    /// on Android, so an unauthenticated GET from a sync worker 401s and reads as "no decisions".
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_getDecisions(
+        env: JNIEnv,
+        _: JClass,
+    ) -> jstring {
+        match openDatastore().get_key_values(&format!(
+            "{}%",
+            crate::combined::DECISION_KEY_PREFIX
+        )) {
+            Ok(stored) => {
+                let mut keys: Vec<&String> = stored.keys().collect();
+                keys.sort();
+                let lines: Vec<serde_json::Value> = keys
+                    .into_iter()
+                    .map(|k| serde_json::Value::String(stored[k].clone()))
+                    .collect();
+                string_to_jstring(&env, serde_json::Value::Array(lines).to_string())
+            }
+            Err(e) => create_error_object(&env, format!("Failed to read decisions: {:?}", e)),
+        }
+    }
+
+    /// Store decisions and tombstones a peer wrote, as a JSON array of raw lines (roadmap 4.2).
+    ///
+    /// Keyed by each record's `id`, so importing the whole shared folder every cycle costs a
+    /// rewrite of what is already there rather than a duplicate — the sync can be dumb and
+    /// repeatable, which is what makes it correct.
+    ///
+    /// Returns `{"success": true, "stored": n, "skipped": n}`. A line this build cannot read is
+    /// skipped, not fatal: `05_DATA_MODEL.md` §8 says a record we do not understand is ignored, and
+    /// one bad line must not stop the other devices' decisions from arriving.
+    #[no_mangle]
+    pub unsafe extern "C" fn Java_net_activitywatch_android_RustInterface_putDecisions(
+        env: JNIEnv,
+        _: JClass,
+        java_lines: JString,
+    ) -> jstring {
+        let raw = jstring_to_string(&env, java_lines);
+        let lines: Vec<String> = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(e) => return create_error_object(&env, format!("not a JSON array of lines: {e}")),
+        };
+        let ds = openDatastore();
+        let (mut stored, mut skipped) = (0u32, 0u32);
+        for line in &lines {
+            match crate::combined::store_record(&ds, line) {
+                Ok(_) => stored += 1,
+                Err(_) => skipped += 1,
+            }
+        }
+        string_to_jstring(
+            &env,
+            json!({ "success": true, "stored": stored, "skipped": skipped }).to_string(),
+        )
+    }
+
     /// Write one setting, matching `POST /api/0/settings/<key>`.
     ///
     /// `java_value` is the raw JSON body -- `"fun"` with its quotes for a string, `[...]` for

@@ -47,7 +47,11 @@ pub(crate) fn attribute(segments: &mut [Segment]) {
                     })
             })
             .expect("every segment has at least one slice (② never emits an empty one)");
-        seg.foreground = foreground;
+        // ④ may already have named the winner. This step is *provisional* — it fills the gap where
+        // no decision exists — so it never overrules one that does.
+        if seg.foreground == usize::MAX {
+            seg.foreground = foreground;
+        }
         seg.unresolved = seg.state == SegmentState::Contended;
     }
 }

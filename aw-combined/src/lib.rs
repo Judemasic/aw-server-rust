@@ -26,13 +26,16 @@ use serde_json::{Map, Value};
 
 use aw_models::Event;
 
+mod apply;
 mod attribute;
 mod classify;
 mod coalesce;
+pub mod decision;
 mod normalise;
 mod segment;
 
 pub use coalesce::coalesce;
+pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
 pub use normalise::resolve_bucket_device;
 
 pub use aw_models::EVENT_ORIGIN_KEY;
@@ -63,6 +66,30 @@ pub struct PipelineInput {
     pub idle: Vec<BucketEvents>,
     /// Minimum contention duration (roadmap D15/Q1). Use [`default_min_contention`].
     pub min_contention: Duration,
+    /// The owner's decisions, already merged across every device ([`merge_decisions`]). Step ④
+    /// applies them; an empty vec is the Phase 3 behaviour, unchanged.
+    ///
+    /// **Order does not matter and must not matter** (R18): ④ picks between two candidates by the
+    /// same precedence the merge uses, never by position.
+    pub decisions: Vec<Decision>,
+}
+
+impl PipelineInput {
+    /// device uuid -> the role name a decision's signature uses for it.
+    ///
+    /// Today that is the device's **hostname**, not `05_DATA_MODEL.md`'s "phone"/"tablet" role: the
+    /// role lives in `devices/<uuid>/meta.json` behind Android's SAF, which neither this crate nor
+    /// the web view can open. A hostname is the strongest identity both ends *can* agree on — it is
+    /// already the shared folder's naming, and it is the same string on every device, which is what
+    /// R18 actually requires. The cost is that a rule does not survive renaming a device; the
+    /// alternative, the *local* display name the sheet used to write, did not even survive being
+    /// read on a second device.
+    pub fn roles_by_uuid(&self) -> HashMap<String, String> {
+        self.hostname_to_uuid
+            .iter()
+            .map(|(hostname, uuid)| (uuid.clone(), hostname.clone()))
+            .collect()
+    }
 }
 
 /// Default for [`PipelineInput::min_contention`] in seconds (roadmap D15/Q1).
@@ -124,6 +151,22 @@ pub struct Segment {
     /// (R8). Provisional attribution changes *which* activity counts; it never clears the shading
     /// (`04` §2.4). A short-contention segment demoted to `Settled` has `unresolved == false`.
     pub unresolved: bool,
+    /// Id of the decision that resolved this segment (④), or `None` while it is still an open
+    /// question. Set for every outcome, including `ignore` — "this counts as nothing" is an answer.
+    pub resolved_by: Option<String>,
+    /// True when [`Segment::resolved_by`] matched by *signature* (`scope: always`) rather than by
+    /// this window, so the view can say which rule did it and offer to revoke it (**R16**).
+    pub auto_resolved: bool,
+    /// The owner's own words for this stretch, when they said neither competitor was right
+    /// (`outcome: relabel`). Replaces the label shown; the time still counts to ⑤'s pick, because
+    /// a relabel says *what* it was, not *whose* it was.
+    pub label_override: Option<String>,
+    /// True when the owner said they were away (`outcome: ignore`): the segment draws, but its
+    /// seconds count toward no total.
+    pub ignored: bool,
+    /// Apps the owner ticked as deliberately running alongside the winner. Kept for the day view
+    /// (**R6** still means one foreground) and for the rules engine R15 builds on this data.
+    pub deliberate_background: Vec<String>,
 }
 
 impl Segment {
@@ -142,16 +185,34 @@ impl Segment {
     }
 }
 
-/// Run ① normalise, ② segment, ③ classify, ⑤ provisional attribution. Deterministic: identical
+/// Run ① normalise, ② segment, ③ classify, ④ apply decisions, ⑤ provisional attribution. Deterministic: identical
 /// input (in any event/bucket order) yields byte-identical output (R18).
 ///
-/// Step ④ (apply decisions) is Phase 4 and slots in between ③ and ⑤. Step ⑥ ([`coalesce`]) is a
-/// separate opt-in call — the pipeline stays lossless by default so Phase 4 can attach decisions
+/// Step ⑥ ([`coalesce`]) is a separate opt-in call — the pipeline stays lossless by default so Phase 4 can attach decisions
 /// to the atomic segments.
 pub fn compute_segments(input: PipelineInput) -> Vec<Segment> {
     let intervals = normalise::normalise(&input);
     let mut segments = segment::segment(&intervals);
     classify::classify(&mut segments, input.min_contention);
+    apply::apply(&mut segments, &input.decisions, &input.roles_by_uuid());
     attribute::attribute(&mut segments);
     segments
+}
+
+/// A human label for one event's `data` — what the combined track calls this activity, and what a
+/// decision's signature names it.
+///
+/// It lives here rather than in the view layer because ④ has to reproduce, exactly, the string the
+/// resolution sheet wrote into a signature. Two spellings of "what app is this" would mean a
+/// decision that never matches the segment it was made about. Falls back rather than failing
+/// (**R19**).
+pub fn activity_label(data: &Map<String, Value>) -> String {
+    for key in ["app", "title", "url"] {
+        if let Some(Value::String(s)) = data.get(key) {
+            if !s.is_empty() {
+                return s.clone();
+            }
+        }
+    }
+    "(unknown)".to_string()
 }

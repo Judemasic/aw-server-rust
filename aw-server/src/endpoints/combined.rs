@@ -18,10 +18,10 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use rocket::http::Status;
-use rocket::serde::json::Value;
+use rocket::serde::json::{Json, Value};
 use rocket::State;
 
-use crate::combined::{combined_timeline, TimelineRequest};
+use crate::combined::{combined_timeline, store_record, stored_records, TimelineRequest};
 use crate::endpoints::{HttpErrorJson, ServerState};
 
 /// Parse one RFC 3339 timestamp, naming which parameter was wrong. The client is a browser sending
@@ -107,4 +107,63 @@ mod tests {
         let msg = serde_json::to_string(&err).unwrap();
         assert!(msg.contains("`end`"), "message should name the parameter: {msg}");
     }
+}
+
+/// `GET /api/0/combined/decisions`
+///
+/// Every decision and tombstone this device holds, as the stored lines themselves — canonical JSON,
+/// keys sorted (see [`crate::combined::store_record`]). The caller that matters is the Android sync
+/// (roadmap 4.2), which copies these lines into `decisions.jsonl` in the Syncthing folder, so what
+/// comes out of here has to be exactly what should go into that file.
+#[get("/decisions")]
+pub fn decisions_get(state: &State<ServerState>) -> Result<Value, HttpErrorJson> {
+    let stored = state
+        .datastore
+        .get_key_values(&format!("{}%", crate::combined::DECISION_KEY_PREFIX))
+        .map_err(|e| {
+            HttpErrorJson::new(
+                Status::InternalServerError,
+                format!("could not read decisions: {e:?}"),
+            )
+        })?;
+    let mut keys: Vec<&String> = stored.keys().collect();
+    keys.sort();
+    let lines: Vec<&str> = keys.into_iter().map(|k| stored[k].as_str()).collect();
+    Ok(serde_json::json!({ "decisions": lines }).into())
+}
+
+/// `POST /api/0/combined/decisions`
+///
+/// Body: one decision or tombstone record, exactly as `05_DATA_MODEL.md` §4 describes it. Storing
+/// it is what makes the next timeline read come back resolved (**R26**) — the pipeline applies
+/// whatever is stored, so there is no second "recompute" call to make and none to forget.
+///
+/// Accepts a record whose `id` already exists and overwrites it. That is not a merge: the merge
+/// (`aw_combined::merge_decisions`) happens at read time across every device's records, and a
+/// repeated id is by definition the same decision, not a competing one.
+#[post("/decisions", data = "<record>")]
+pub fn decisions_post(
+    record: Json<Value>,
+    state: &State<ServerState>,
+) -> Result<Value, HttpErrorJson> {
+    // Serialised from the parsed body rather than taken as a string: Rocket has already validated
+    // that it is JSON, and `store_record` normalises it anyway.
+    let raw = record.0.to_string();
+    let id = store_record(&state.datastore, &raw)
+        .map_err(|e| HttpErrorJson::new(Status::BadRequest, e))?;
+    Ok(serde_json::json!({ "success": true, "id": id }).into())
+}
+
+/// `GET /api/0/combined/decisions/effective`
+///
+/// What actually applies, after the deterministic merge across every device's records
+/// (`05_DATA_MODEL.md` §4.2) — revoked decisions dropped, one winner per window and signature.
+/// The view uses it to name the rule that auto-resolved a segment; a human reads it to see why the
+/// timeline looks the way it does.
+#[get("/decisions/effective")]
+pub fn decisions_effective(state: &State<ServerState>) -> Result<Value, HttpErrorJson> {
+    let records = stored_records(&state.datastore)
+        .map_err(|e| HttpErrorJson::new(Status::InternalServerError, e))?;
+    let merged = aw_combined::merge_decisions(&records);
+    Ok(serde_json::json!({ "decisions": merged }).into())
 }

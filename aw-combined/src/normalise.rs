@@ -181,6 +181,7 @@ mod tests {
             activity,
             idle,
             min_contention: crate::default_min_contention(),
+            decisions: Vec::new(),
         }
     }
 

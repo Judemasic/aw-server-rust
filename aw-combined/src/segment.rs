@@ -57,8 +57,13 @@ pub(crate) fn segment(intervals: &[Interval]) -> Vec<Segment> {
             state: SegmentState::Settled, // set by ③
             active,
             absorbed_short_contention: false,
-            foreground: usize::MAX, // set by ⑤
+            foreground: usize::MAX, // set by ④ or ⑤
             unresolved: false,      // set by ⑤
+            resolved_by: None,      // set by ④
+            auto_resolved: false,   // set by ④
+            label_override: None,   // set by ④
+            ignored: false,         // set by ④
+            deliberate_background: Vec::new(), // set by ④
         });
     }
     segments

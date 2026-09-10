@@ -46,6 +46,7 @@ fn base(activity: Vec<BucketEvents>) -> PipelineInput {
         activity,
         idle: vec![],
         min_contention: aw_combined::default_min_contention(),
+        decisions: Vec::new(),
     }
 }
 
