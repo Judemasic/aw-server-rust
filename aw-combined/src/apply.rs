@@ -45,12 +45,12 @@ pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &Ha
     }
 
     for seg in segments.iter_mut() {
-        let key = segment_match_key(seg, roles);
+        let keys = segment_match_keys(seg, roles);
 
         // Pass 1: the narrowest thing there is — a decision recorded over this very time.
         let mut exact: Option<&Decision> = None;
         for decision in decisions {
-            if decision.signature.match_key() != key {
+            if !keys.contains(&decision.signature.match_key()) {
                 continue;
             }
             let Some((start, end)) = decision.window_bounds() else {
@@ -70,7 +70,7 @@ pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &Ha
 
         let (decision, by_rule) = match exact {
             Some(d) => (d, false),
-            None => match best_rule.get(&key) {
+            None => match keys.iter().find_map(|k| best_rule.get(k)) {
                 Some(d) => (*d, true),
                 None => continue,
             },
@@ -79,17 +79,36 @@ pub(crate) fn apply(segments: &mut [Segment], decisions: &[Decision], roles: &Ha
     }
 }
 
-/// The signature this segment would be recorded under: every competing device/app, canonically
-/// ordered, with the same fields the sheet writes.
+/// Every signature key this segment could have been recorded under.
 ///
-/// Duplicates collapse. A heartbeat-split event puts one device's app into `active` twice, which
-/// would otherwise produce a two-participant signature for what the owner was shown as one row —
-/// and no decision they made would ever match it again.
-fn segment_match_key(seg: &Segment, roles: &HashMap<String, String>) -> String {
+/// Normally one: the participants, canonically ordered, with the same fields the sheet writes.
+///
+/// **Two when the roles are named.** Records written before the server learned to resolve hostnames
+/// carry the device *uuid* in `device_role`, because the hostname map was never populated and both
+/// ends fell back to the uuid identically. Those decisions are correct and the owner made them on
+/// purpose; matching only the new spelling would make them silently stop applying, and a resolved
+/// block quietly going back to asking is worse than never having resolved it. So the uuid form is
+/// tried too. It costs one extra string compare and it can be dropped once no such records remain
+/// — there is no way to know when that is, so it stays.
+///
+/// Duplicates collapse within a key. A heartbeat-split event puts one device's app into `active`
+/// twice, which would otherwise produce a two-participant signature for what the owner was shown as
+/// one row — and no decision they made would ever match it again.
+fn segment_match_keys(seg: &Segment, roles: &HashMap<String, String>) -> Vec<String> {
+    let named = signature_of(seg, |uuid| role_of(uuid, roles));
+    let by_uuid = signature_of(seg, |uuid| uuid.to_string());
+    if named == by_uuid {
+        vec![named]
+    } else {
+        vec![named, by_uuid]
+    }
+}
+
+fn signature_of(seg: &Segment, role: impl Fn(&str) -> String) -> String {
     let mut participants: Vec<Participant> = Vec::new();
     for slice in &seg.active {
         let participant = Participant {
-            device_role: role_of(&slice.device, roles),
+            device_role: role(&slice.device),
             device_uuid: slice.device.clone(),
             app: activity_label(&slice.data),
             // Not surfaced by the pipeline yet; the sheet writes null for the same reason. When

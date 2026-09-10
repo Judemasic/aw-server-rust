@@ -339,3 +339,63 @@ fn a_heartbeat_split_event_still_matches_the_decision_made_about_it() {
     let segs = coalesce(compute_segments(input));
     assert_eq!(segs[0].resolved_by.as_deref(), Some("d_1"));
 }
+
+/// Records written before the server learned to resolve hostnames put the device **uuid** in
+/// `device_role`. They are real decisions the owner made, and they must keep applying: a resolved
+/// block quietly going back to asking is worse than never having resolved it.
+#[test]
+fn a_decision_recorded_with_uuid_roles_still_applies() {
+    let by_uuid = json!({
+        "id": "d_old",
+        "type": "decision",
+        "created_at": "2026-09-10T11:00:00Z",
+        "created_by": PHONE,
+        "window": { "start": t(0).to_rfc3339(), "end": t(60).to_rfc3339() },
+        // The old spelling: role == uuid, on both participants and on the pick.
+        "signature": { "participants": [
+            { "device_role": PHONE, "device_uuid": PHONE, "app": "YouTube", "category": null },
+            { "device_role": TABLET, "device_uuid": TABLET, "app": "Kindle", "category": null },
+        ]},
+        "resolution": {
+            "outcome": "foreground",
+            "foreground": { "device_role": TABLET, "device_uuid": TABLET, "app": "Kindle" },
+            "label": null,
+            "deliberate_background": ["YouTube"],
+        },
+        "scope": "once",
+    })
+    .to_string();
+
+    // `hostnames()` is populated, so the segment's own key now uses hostnames — the case that
+    // would have stopped matching.
+    let segs = overlap(&[by_uuid], PHONE);
+    assert_eq!(segs[0].resolved_by.as_deref(), Some("d_old"));
+    assert_eq!(segs[0].foreground_slice().device, TABLET);
+}
+
+/// The same, for a standing rule: those are the records that most need to outlive a spelling change.
+#[test]
+fn a_rule_recorded_with_uuid_roles_still_applies() {
+    let rule = json!({
+        "id": "r_old",
+        "type": "decision",
+        "created_at": "2026-09-10T11:00:00Z",
+        "created_by": PHONE,
+        "window": { "start": t(-600).to_rfc3339(), "end": t(-540).to_rfc3339() },
+        "signature": { "participants": [
+            { "device_role": PHONE, "device_uuid": PHONE, "app": "YouTube", "category": null },
+            { "device_role": TABLET, "device_uuid": TABLET, "app": "Kindle", "category": null },
+        ]},
+        "resolution": {
+            "outcome": "foreground",
+            "foreground": { "device_role": TABLET, "device_uuid": TABLET, "app": "Kindle" },
+            "label": null,
+            "deliberate_background": [],
+        },
+        "scope": "always",
+    })
+    .to_string();
+    let segs = overlap(&[rule], PHONE);
+    assert_eq!(segs[0].resolved_by.as_deref(), Some("r_old"));
+    assert!(segs[0].auto_resolved);
+}
