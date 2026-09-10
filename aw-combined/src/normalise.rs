@@ -70,6 +70,19 @@ pub fn resolve_bucket_device(events: &[Event], bucket_id: &str, input: &Pipeline
     input.own_device.clone()
 }
 
+/// The peer hostname a synced bucket names, if it is one.
+///
+/// The bucket id is the only place a *shared* name for a device survives without the shared folder:
+/// `-synced-from-<peer>` is written by the sync itself and reads the same on every device. That is
+/// what makes it usable as a decision's `device_role` (`04_COMBINED_TIMELINE.md` §3), where the
+/// local display name — a nickname typed on one device — is not.
+pub fn synced_from_hostname(bucket_id: &str) -> Option<&str> {
+    bucket_id
+        .find(SYNCED_FROM)
+        .map(|idx| &bucket_id[idx + SYNCED_FROM.len()..])
+        .filter(|peer| !peer.is_empty())
+}
+
 /// Flatten buckets to intervals, resolving origin and dropping `end <= start` (Android watchers
 /// emit zero-duration heartbeats, e.g. `aw-watcher-android-unlock`).
 fn to_intervals(buckets: &[BucketEvents], input: &PipelineInput) -> Vec<Interval> {

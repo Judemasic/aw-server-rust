@@ -19,7 +19,7 @@ use serde_json::{json, Map, Value};
 
 use aw_combined::{
     activity_label, coalesce, compute_segments, default_min_contention, merge_decisions, parse_line,
-    resolve_bucket_device, BucketEvents, PipelineInput, Segment, SharedRecord,
+    resolve_bucket_device, synced_from_hostname, BucketEvents, PipelineInput, Segment, SharedRecord,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -47,6 +47,10 @@ pub struct TimelineRequest {
     pub end: DateTime<Utc>,
     pub own_device: String,
     pub hostname_to_uuid: HashMap<String, String>,
+    /// This machine's hostname, for naming the *own* device where a peer is named by the
+    /// `-synced-from-<peer>` suffix in its bucket ids. Without it the one device whose events carry
+    /// no suffix — this one — would be the only one left showing a uuid.
+    pub own_hostname: String,
 }
 
 /// A human label for one event's `data`, for a track row.
@@ -125,6 +129,20 @@ fn is_idle(event: &Event) -> bool {
     )
 }
 
+/// A pipeline input carrying only what [`resolve_bucket_device`] reads, for resolving a bucket's
+/// device *before* the real input exists. The map is deliberately whatever the caller passed and no
+/// more: this call is what fills the rest in, so seeding it from itself would be circular.
+fn probe(req: &TimelineRequest) -> PipelineInput {
+    PipelineInput {
+        own_device: req.own_device.clone(),
+        hostname_to_uuid: req.hostname_to_uuid.clone(),
+        activity: Vec::new(),
+        idle: Vec::new(),
+        min_contention: default_min_contention(),
+        decisions: Vec::new(),
+    }
+}
+
 /// Read one day (or any range) out of the datastore and return the combined track, the per-device
 /// tracks, and the totals, as JSON.
 ///
@@ -158,9 +176,28 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         }
     }
 
+    // Peers name themselves in their bucket ids (`-synced-from-<peer>`), which is a name every
+    // device reads identically — unlike a local nickname. Fill in from there whatever the caller
+    // did not supply, so a decision's `device_role` is a hostname and not a uuid
+    // (`04_COMBINED_TIMELINE.md` §3). Roadmap 4.2 shipped without this and every recorded role was
+    // a uuid: correct, because both sides fell back the same way, but a rule keyed on it could
+    // never outlive the device that made it, which is the whole point of a role.
+    let mut hostname_to_uuid = req.hostname_to_uuid.clone();
+    for bucket in &activity {
+        if let Some(peer) = synced_from_hostname(&bucket.bucket_id) {
+            let device = resolve_bucket_device(&bucket.events, &bucket.bucket_id, &probe(req));
+            hostname_to_uuid.entry(peer.to_string()).or_insert(device);
+        }
+    }
+    if !req.own_hostname.is_empty() {
+        hostname_to_uuid
+            .entry(req.own_hostname.clone())
+            .or_insert_with(|| req.own_device.clone());
+    }
+
     let input = PipelineInput {
         own_device: req.own_device.clone(),
-        hostname_to_uuid: req.hostname_to_uuid.clone(),
+        hostname_to_uuid,
         activity,
         idle,
         // D15/Q1's default. Not a setting yet — nothing in the app exposes one, and 3.4 is about

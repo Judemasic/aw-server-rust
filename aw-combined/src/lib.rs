@@ -36,7 +36,7 @@ mod segment;
 
 pub use coalesce::coalesce;
 pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
-pub use normalise::resolve_bucket_device;
+pub use normalise::{resolve_bucket_device, synced_from_hostname};
 
 pub use aw_models::EVENT_ORIGIN_KEY;
 

@@ -78,6 +78,11 @@ pub fn timeline(
         // caller to get wrong here, so it is deliberately not a parameter.
         own_device: state.device_id.clone(),
         hostname_to_uuid,
+        // Same source `GET /api/0/info` reports, so the name a decision records for this device is
+        // the name everything else already calls it.
+        own_hostname: gethostname::gethostname()
+            .into_string()
+            .unwrap_or_else(|_| String::new()),
     };
 
     combined_timeline(&state.datastore, &req)
