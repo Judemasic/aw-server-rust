@@ -12,6 +12,8 @@ pub trait AccessMethod: std::fmt::Debug {
     fn get_buckets(&self) -> Result<HashMap<String, Bucket>, String>;
     fn get_bucket(&self, bucket_id: &str) -> Result<Bucket, DatastoreError>;
     fn create_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError>;
+    /// Correct an existing bucket's hostname/client/type/data. Id, created and events untouched.
+    fn update_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError>;
     fn get_events(
         &self,
         bucket_id: &str,
@@ -33,6 +35,11 @@ impl AccessMethod for Datastore {
     }
     fn create_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
         Datastore::create_bucket(self, bucket)?;
+        self.force_commit().unwrap();
+        Ok(())
+    }
+    fn update_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
+        Datastore::update_bucket(self, bucket)?;
         self.force_commit().unwrap();
         Ok(())
     }
@@ -98,6 +105,11 @@ impl AccessMethod for AwClient {
     }
     fn create_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
         AwClient::create_bucket(self, bucket)
+            .map_err(|e| DatastoreError::InternalError(e.to_string()))?;
+        Ok(())
+    }
+    fn update_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
+        AwClient::update_bucket(self, bucket)
             .map_err(|e| DatastoreError::InternalError(e.to_string()))?;
         Ok(())
     }

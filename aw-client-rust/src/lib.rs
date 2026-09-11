@@ -107,6 +107,14 @@ impl AwClient {
         Ok(())
     }
 
+    /// Update an existing bucket's descriptive metadata (hostname, client, type, data).
+    /// Its id, creation time and events are left alone.
+    pub async fn update_bucket(&self, bucket: &Bucket) -> Result<(), reqwest::Error> {
+        let url = format!("{}api/0/buckets/{}", self.baseurl, bucket.id);
+        Self::send_success(self.client.put(url).json(bucket)).await?;
+        Ok(())
+    }
+
     pub async fn create_bucket_simple(
         &self,
         bucketname: &str,

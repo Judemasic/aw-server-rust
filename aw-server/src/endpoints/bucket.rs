@@ -100,6 +100,42 @@ pub fn bucket_new(
     }
 }
 
+/// Update an existing bucket's descriptive metadata (hostname, client, type, data).
+///
+/// A bucket's identity — its id, its creation time, its events — is not touched. This
+/// exists so a device that corrects its own name can correct what it has already written,
+/// rather than being stuck with whatever name it happened to have the first time.
+#[put("/<bucket_id>", data = "<message>", format = "application/json")]
+pub fn bucket_update(
+    bucket_id: &str,
+    message: Json<Bucket>,
+    state: &State<ServerState>,
+) -> Result<(), HttpErrorJson> {
+    let mut bucket = message.into_inner();
+    bucket.id = bucket_id.to_string();
+    if bucket.hostname == "!local" {
+        bucket.hostname = gethostname()
+            .into_string()
+            .unwrap_or_else(|_| "unknown".to_string());
+        bucket
+            .data
+            .insert("device_id".to_string(), state.device_id.clone().into());
+    } else if bucket.hostname.contains(char::is_whitespace) {
+        // Same rule as bucket_new: a hostname with whitespace in it comes from a
+        // misconfigured client and produces buckets that are awkward to address.
+        let err_msg = format!(
+            "Invalid hostname {:?}: hostname may not contain whitespace",
+            bucket.hostname
+        );
+        warn!("{}", err_msg);
+        return Err(HttpErrorJson::new(Status::BadRequest, err_msg));
+    }
+    state
+        .datastore
+        .update_bucket(&bucket)
+        .map_err(|err| err.into())
+}
+
 #[get("/<bucket_id>/events?<start>&<end>&<limit>")]
 pub fn bucket_events_get(
     bucket_id: &str,

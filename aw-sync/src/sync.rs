@@ -226,24 +226,54 @@ fn get_or_create_sync_bucket(
         )
     };
 
+    // The metadata this bucket should carry, derived fresh from the source every time.
+    let mut bucket_want = bucket_from.clone();
+    bucket_want.id = new_id.clone();
+    // Only stamp $aw.sync.origin on pull/import.  The derived origin already handles
+    // the legacy case: hostname is used when the source bucket has no metadata field.
+    if let Some(origin) = sync_origin {
+        bucket_want
+            .data
+            .insert("$aw.sync.origin".to_string(), serde_json::json!(origin));
+    } else {
+        // Push path: strip any stale $aw.sync.origin that bucket_from may carry
+        // (e.g. if it was previously imported by a pull).  Staging copies must
+        // never look like synced-from-remote buckets.
+        bucket_want.data.remove("$aw.sync.origin");
+    }
+
     match ds_to.get_bucket(new_id.as_str()) {
-        Ok(bucket) => bucket,
-        Err(DatastoreError::NoSuchBucket(_)) => {
-            let mut bucket_new = bucket_from.clone();
-            bucket_new.id = new_id.clone();
-            // Only stamp $aw.sync.origin on pull/import.  The derived origin already handles
-            // the legacy case: hostname is used when the source bucket has no metadata field.
-            if let Some(origin) = sync_origin {
-                bucket_new
-                    .data
-                    .insert("$aw.sync.origin".to_string(), serde_json::json!(origin));
+        Ok(bucket) => {
+            // An existing bucket used to be returned untouched, which froze whatever
+            // metadata it had the first time it was written.  A device that corrected its
+            // own name could then never correct what it had already staged, and its peers
+            // went on reading the stale name as the origin of the data.  So refresh the
+            // descriptive fields from the source whenever they have drifted.  Events,
+            // creation time and id are not involved.
+            if bucket_metadata_differs(&bucket, &bucket_want) {
+                info!(
+                    "Refreshing stale metadata on bucket {} (hostname {:?} -> {:?})",
+                    new_id, bucket.hostname, bucket_want.hostname
+                );
+                match ds_to.update_bucket(&bucket_want) {
+                    Ok(()) => match ds_to.get_bucket(new_id.as_str()) {
+                        Ok(bucket) => bucket,
+                        Err(e) => panic!("{e:?}"),
+                    },
+                    Err(e) => {
+                        // A refused refresh is cosmetic: the bucket still holds the right
+                        // events under the right id.  Carry on with the stale copy rather
+                        // than aborting a sync over a name.
+                        warn!("Could not refresh metadata on bucket {new_id}: {e:?}");
+                        bucket
+                    }
+                }
             } else {
-                // Push path: strip any stale $aw.sync.origin that bucket_from may carry
-                // (e.g. if it was previously imported by a pull).  Staging copies must
-                // never look like synced-from-remote buckets.
-                bucket_new.data.remove("$aw.sync.origin");
+                bucket
             }
-            ds_to.create_bucket(&bucket_new).unwrap();
+        }
+        Err(DatastoreError::NoSuchBucket(_)) => {
+            ds_to.create_bucket(&bucket_want).unwrap();
             match ds_to.get_bucket(new_id.as_str()) {
                 Ok(bucket) => bucket,
                 Err(e) => panic!("{e:?}"),
@@ -251,6 +281,17 @@ fn get_or_create_sync_bucket(
         }
         Err(e) => panic!("{e:?}"),
     }
+}
+
+/// Whether the descriptive metadata of `have` has drifted from what `want` says it
+/// should be.  Deliberately ignores everything that is not descriptive — id, created,
+/// last_updated, events and the row id — so an otherwise identical bucket is not
+/// rewritten on every sync pass.
+fn bucket_metadata_differs(have: &Bucket, want: &Bucket) -> bool {
+    have.hostname != want.hostname
+        || have.client != want.client
+        || have._type != want._type
+        || have.data != want.data
 }
 
 /// Number of events fetched per page in the chunked-fetch loop in `sync_one`.

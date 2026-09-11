@@ -57,6 +57,7 @@ pub enum Response {
 #[derive(Debug, Clone)]
 pub enum Command {
     CreateBucket(Bucket),
+    UpdateBucket(Bucket),
     DeleteBucket(String),
     GetBucket(String),
     GetBuckets(),
@@ -291,6 +292,13 @@ impl DatastoreWorker {
                 }
                 Err(e) => Err(e),
             },
+            Command::UpdateBucket(bucket) => match ds.update_bucket(tx, &bucket) {
+                Ok(_) => {
+                    self.commit = true;
+                    Ok(Response::Empty())
+                }
+                Err(e) => Err(e),
+            },
             Command::DeleteBucket(bucketname) => match ds.delete_bucket(tx, &bucketname) {
                 Ok(_) => {
                     self.commit = true;
@@ -498,6 +506,11 @@ impl Datastore {
 
     pub fn create_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
         let cmd = Command::CreateBucket(bucket.clone());
+        _unwrap_empty_response(self.request(cmd)?)
+    }
+
+    pub fn update_bucket(&self, bucket: &Bucket) -> Result<(), DatastoreError> {
+        let cmd = Command::UpdateBucket(bucket.clone());
         _unwrap_empty_response(self.request(cmd)?)
     }
 

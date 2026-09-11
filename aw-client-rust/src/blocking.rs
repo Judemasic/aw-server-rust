@@ -60,6 +60,7 @@ impl AwClient {
     proxy_method!(get_bucket, Bucket, bucketname: &str);
     proxy_method!(get_buckets, HashMap<String, Bucket>,);
     proxy_method!(create_bucket, (), bucket: &Bucket);
+    proxy_method!(update_bucket, (), bucket: &Bucket);
     proxy_method!(create_bucket_simple, (), bucketname: &str, buckettype: &str);
     proxy_method!(delete_bucket, (), bucketname: &str);
     proxy_method!(

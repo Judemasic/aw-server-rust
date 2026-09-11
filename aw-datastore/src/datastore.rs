@@ -421,6 +421,50 @@ impl DatastoreInstance {
         }
     }
 
+    /// Update the mutable metadata of an existing bucket: hostname, client, type and data.
+    ///
+    /// A bucket's identity (`id`, `created`, its events) is untouched — only the
+    /// descriptive fields a device can legitimately correct about itself. This exists
+    /// because a bucket written once could never be corrected afterwards, so a device
+    /// that fixed its own name could not fix what it had already staged for its peers.
+    pub fn update_bucket(
+        &mut self,
+        conn: &Connection,
+        bucket: &Bucket,
+    ) -> Result<(), DatastoreError> {
+        let existing = (self.get_bucket(&bucket.id))?;
+        let data = serde_json::to_string(&bucket.data).unwrap();
+        let res = conn.execute(
+            "
+                UPDATE buckets
+                SET type = ?1, client = ?2, hostname = ?3, data = ?4
+                WHERE id = ?5",
+            rusqlite::params![
+                &bucket._type,
+                &bucket.client,
+                &bucket.hostname,
+                &data,
+                &existing.bid,
+            ],
+        );
+        match res {
+            Ok(_) => {
+                let mut cached = existing;
+                cached._type = bucket._type.clone();
+                cached.client = bucket.client.clone();
+                cached.hostname = bucket.hostname.clone();
+                cached.data = bucket.data.clone();
+                cached.events = None;
+                info!("Updated bucket {}", bucket.id);
+                self.buckets_cache.insert(bucket.id.clone(), cached);
+                Ok(())
+            }
+            Err(err) => Err(DatastoreError::InternalError(format!(
+                "Failed to execute update_bucket SQL statement: {err}"
+            ))),
+        }
+    }
+
     pub fn delete_bucket(
         &mut self,
         conn: &Connection,

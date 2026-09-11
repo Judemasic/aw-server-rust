@@ -176,6 +176,7 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
             "/api/0/buckets",
             routes![
                 bucket::bucket_new,
+                bucket::bucket_update,
                 bucket::bucket_delete,
                 bucket::buckets_get,
                 bucket::bucket_get,

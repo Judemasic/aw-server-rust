@@ -203,6 +203,108 @@ mod sync_tests {
         );
     }
 
+    /// Roadmap 4.4c: a staged bucket used to keep whatever hostname it had the first time it
+    /// was written, forever, so a device that corrected its own name could never correct what
+    /// its peers were reading as the origin of its data.  A second push must refresh it.
+    #[test]
+    fn test_staged_bucket_metadata_is_refreshed() {
+        let state = init_teststate();
+
+        // A bucket first staged under the device's UUID, the way aw-stopwatch was.
+        let bucket_id = "aw-stopwatch".to_string();
+        let bucket: Bucket = serde_json::from_value(serde_json::json!({
+            "id": bucket_id,
+            "type": "test",
+            "hostname": "7b54cfe9-ec39-4ec3-934c-67c81111d8e7",
+            "client": "aw-webui",
+        }))
+        .unwrap();
+        state.ds_src.create_bucket(&bucket).unwrap();
+        state
+            .ds_src
+            .insert_events(&bucket_id, &[create_event(r#"{"test": 1}"#)])
+            .unwrap();
+
+        aw_sync::sync_datastores(
+            &state.ds_src,
+            &state.ds_dest,
+            true,
+            Some("device-0"),
+            &SyncSpec::default(),
+        );
+        assert_eq!(
+            state.ds_dest.get_bucket(&bucket_id).unwrap().hostname,
+            "7b54cfe9-ec39-4ec3-934c-67c81111d8e7"
+        );
+        let created_before = state.ds_dest.get_bucket(&bucket_id).unwrap().created;
+
+        // The device learns its real name and fixes the bucket locally...
+        let mut fixed = state.ds_src.get_bucket(&bucket_id).unwrap();
+        fixed.hostname = "jude-phone".to_string();
+        fixed
+            .data
+            .insert("device_id".to_string(), serde_json::json!("dev-0"));
+        state.ds_src.update_bucket(&fixed).unwrap();
+
+        // ...and the next push must carry the correction through to staging.
+        aw_sync::sync_datastores(
+            &state.ds_src,
+            &state.ds_dest,
+            true,
+            Some("device-0"),
+            &SyncSpec::default(),
+        );
+
+        let staged = state.ds_dest.get_bucket(&bucket_id).unwrap();
+        assert_eq!(
+            staged.hostname, "jude-phone",
+            "staged bucket should have picked up the corrected hostname"
+        );
+        assert_eq!(
+            staged.data.get("device_id"),
+            Some(&serde_json::json!("dev-0")),
+            "staged bucket should have picked up the corrected data"
+        );
+        assert_eq!(
+            staged.created, created_before,
+            "refreshing metadata must not change the bucket's creation time"
+        );
+        assert_eq!(
+            state.ds_dest.get_event_count(&bucket_id, None, None).unwrap(),
+            1,
+            "refreshing metadata must not disturb the bucket's events"
+        );
+        assert!(
+            !staged.data.contains_key("$aw.sync.origin"),
+            "a refreshed staging copy must still not look like a synced-from bucket"
+        );
+    }
+
+    /// The refresh must not undo the origin stamping a pull does: a pulled bucket keeps its
+    /// $aw.sync.origin across repeated pulls rather than having it rewritten away.
+    #[test]
+    fn test_pulled_bucket_keeps_origin_across_repeated_pulls() {
+        let state = init_teststate();
+        let bucket_id = create_bucket(&state.ds_src, 0);
+        let pulled_id = format!("{bucket_id}-synced-from-device-0");
+
+        for _ in 0..2 {
+            aw_sync::sync_datastores(
+                &state.ds_src,
+                &state.ds_dest,
+                false,
+                None,
+                &SyncSpec::default(),
+            );
+        }
+
+        let pulled = state.ds_dest.get_bucket(&pulled_id).unwrap();
+        assert_eq!(
+            pulled.data.get("$aw.sync.origin"),
+            Some(&serde_json::json!("device-0"))
+        );
+    }
+
     /// Roadmap 3.1: an event copied in from another device must say which device that was, so the
     /// combined timeline can attribute it without parsing bucket ids.
     #[test]
