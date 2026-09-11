@@ -23,6 +23,10 @@
 //!    one-second and 17-millisecond segments; that is watcher jitter, not a preference.
 //! 3. **Went-and-came-back.** `A, B, A` with `B` under the threshold: `B` joins `A`. The strongest
 //!    rule of the set — the bracket *is* the evidence that the stretch was really one stretch.
+//! 3b. **The detour may be several apps long** (roadmap 4.5c, the owner's own example:
+//!    `YouTube, Photos, Gallery, YouTube`). The bracket is looked for *outward past a whole run* of
+//!    sub-threshold blocks, and the run is then peeled from its ends so every piece of it lands in
+//!    one of the two anchors rather than in another sliver. See [`bracketed`].
 //! 5. **`A, B, C` with `B` short and no bracket stays literal.** Genuinely ambiguous; guessing is
 //!    worse than leaving it.
 //! 6. **A decided stretch never shatters.** Segments sharing one `resolved_by` join each other at
@@ -34,6 +38,17 @@
 //!    number can only ever absorb more. See [`target_for`] for the day that proved it matters.
 //! 8. **Off means literal.** A threshold of zero disables 3 and 6; only the noise floor survives.
 //!
+//! # Holes are not gaps (roadmap 4.5c)
+//!
+//! None of the above did anything at all on real data until 4.5c, and the reason was one `==`.
+//! Neighbours were found with `prev.end == next.start`, and a watcher's events do not meet exactly:
+//! 168 of 364 adjacent pairs on the owner's measured day had a hole of a few milliseconds between
+//! them, which meant the sliver in the middle had *no neighbour* to be absorbed into. Setting the
+//! threshold to 0, 15 or 60 seconds produced byte-identical days. A hole under
+//! [`crate::JITTER_GAP_MS`] is now treated as no hole, here and in ⑥, and the milliseconds bridged
+//! that way are recorded in [`Segment::bridged_ms`] so that they are drawn over without being
+//! counted.
+//!
 //! Rule 4 of the roadmap's list — *transit apps*, `A, Home, B` absorbing forward into `B` — is
 //! deliberately **not** implemented. It needs the app to decide which apps are "transit", and the
 //! owner's ruling on the launcher was that it does count and should be left alone. Choosing what
@@ -41,7 +56,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::{activity_label, Segment};
+use crate::{activity_label, coalesce::adjacent, coalesce::seed_shares, Segment};
 
 /// Default sliver threshold in seconds — the owner's answer, 2026-09-10 (*"okay 15s"*).
 pub const DEFAULT_SLIVER_SECS: i64 = 15;
@@ -87,6 +102,9 @@ struct Absorption {
 /// output changes nothing.
 pub fn smooth(segments: Vec<Segment>, opts: SmoothOptions) -> Vec<Segment> {
     let mut segs = segments;
+    // ⑥ normally did this already; doing it here too means ⑦ can be run on its own in a test and the
+    // share invariant still holds.
+    seed_shares(&mut segs);
     // Every pass removes exactly one segment, so this cannot spin.
     while let Some(a) = next_absorption(&segs, &opts) {
         absorb(&mut segs, a);
@@ -114,16 +132,20 @@ fn joinable(a: &Segment, b: &Segment) -> bool {
 }
 
 /// Index of the neighbour before `i`, if it is contiguous and joinable.
+///
+/// Contiguous *within jitter* — see [`crate::JITTER_GAP_MS`]. Exact equality was the bug that made
+/// this whole module a no-op on real data: a 33ms hole left a sliver with no neighbour at all, so
+/// there was nothing for it to be absorbed into and the threshold changed nothing.
 fn prev_of(segs: &[Segment], i: usize) -> Option<usize> {
     let p = i.checked_sub(1)?;
-    (segs[p].end == segs[i].start && joinable(&segs[p], &segs[i])).then_some(p)
+    (adjacent(&segs[p], &segs[i]) && joinable(&segs[p], &segs[i])).then_some(p)
 }
 
 /// Index of the neighbour after `i`, if it is contiguous and joinable.
 fn next_of(segs: &[Segment], i: usize) -> Option<usize> {
     let n = i + 1;
     let after = segs.get(n)?;
-    (after.start == segs[i].end && joinable(&segs[i], after)).then_some(n)
+    (adjacent(&segs[i], after) && joinable(&segs[i], after)).then_some(n)
 }
 
 fn span(seg: &Segment) -> Duration {
@@ -144,7 +166,7 @@ fn longer(segs: &[Segment], prev: Option<usize>, next: Option<usize>) -> Option<
 ///
 /// This is the whole of the rule set. **Where** it goes is a separate question, answered by
 /// [`longer`] and never by which rule said yes — see the note there.
-fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions, bracketed: bool) -> bool {
+fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions) -> bool {
     let seg = &segs[i];
 
     // Rule 6 — inside one decision's window, at any size. `joinable` has already established that
@@ -161,7 +183,61 @@ fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions, bracketed: bool)
     }
 
     // Rule 3 — went and came back. Rule 5 is the `else`: short, unbracketed, and left literal.
-    !opts.sliver.is_zero() && dur < opts.sliver && bracketed
+    if opts.sliver.is_zero() || dur >= opts.sliver || !bracketed(segs, i, opts) {
+        return false;
+    }
+    // Rule 3b — peel the run from its ends, never from the middle. A sliver with a real block on
+    // one side goes into it now; one with slivers on both sides waits for an end to reach it. See
+    // [`bracketed`] for why waiting is what makes the run land in one place.
+    [prev_of(segs, i), next_of(segs, i)]
+        .into_iter()
+        .flatten()
+        .any(|j| span(&segs[j]) >= opts.sliver)
+}
+
+/// The nearest real block on each side, looking **outward past a whole run of slivers**, and whether
+/// those two are the same activity on the same device.
+///
+/// This is rule 3 as the owner asked for it on 2026-09-11: *"the smoothing should take youtube,
+/// photos, gallery, then youtube — if photos and gallery are less than the smoothing then take
+/// them"*. The rule used to look only at the two immediate neighbours, so `YouTube, Photos, Gallery,
+/// YouTube` smoothed to nothing at all: neither `Photos` nor `Gallery` was bracketed by a matching
+/// pair, and both fell through to rule 5 and stayed literal. The bracket is the evidence that the
+/// stretch was really one stretch, and it is no weaker for the detour having touched two apps
+/// instead of one.
+///
+/// Each hop uses [`prev_of`]/[`next_of`], so a real gap or an answered block ends the walk — the run
+/// may not be crossed over a hole or over somebody's decision. The walk terminates because it moves
+/// one index per step.
+///
+/// **Why the run is then peeled from its ends** (rule 3b, in [`absorbable`]) rather than collapsed
+/// in any order: a sliver in the middle of a run has slivers on both sides, and letting it join one
+/// of *those* would build a block that is neither anchor's app and may now be over the threshold —
+/// `A, b1, b2, b3, A` could end up as `A, b1+b2 (24s), A`, which is a block the day never had.
+/// Peeling from the ends means every sliver in the run lands in an anchor, and since both anchors
+/// carry the same label by the test below, which one it lands in says the same thing about the day.
+fn bracketed(segs: &[Segment], i: usize, opts: &SmoothOptions) -> bool {
+    let anchor = |back: bool| -> Option<usize> {
+        let mut at = i;
+        loop {
+            let step = if back {
+                prev_of(segs, at)?
+            } else {
+                next_of(segs, at)?
+            };
+            if span(&segs[step]) >= opts.sliver {
+                return Some(step);
+            }
+            at = step;
+        }
+    };
+    match (anchor(true), anchor(false)) {
+        (Some(p), Some(n)) => {
+            let (a, b) = (&segs[p], &segs[n]);
+            a.foreground_slice().device == b.foreground_slice().device && label_of(a) == label_of(b)
+        }
+        _ => false,
+    }
 }
 
 /// Where segment `i` should go, if anywhere.
@@ -176,21 +252,10 @@ fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions, bracketed: bool)
 /// the longer one says exactly the same thing about the day and keeps the guarantee: raising the
 /// number can only ever absorb more.
 fn target_for(segs: &[Segment], i: usize, opts: &SmoothOptions) -> Option<usize> {
-    let prev = prev_of(segs, i);
-    let next = next_of(segs, i);
-
-    let bracketed = match (prev, next) {
-        (Some(p), Some(n)) => {
-            let (a, b) = (&segs[p], &segs[n]);
-            a.foreground_slice().device == b.foreground_slice().device && label_of(a) == label_of(b)
-        }
-        _ => false,
-    };
-
-    if !absorbable(segs, i, opts, bracketed) {
+    if !absorbable(segs, i, opts) {
         return None;
     }
-    longer(segs, prev, next)
+    longer(segs, prev_of(segs, i), next_of(segs, i))
 }
 
 /// The single best absorption to do next, by rule 7's total order: shortest first, then label, then
@@ -232,17 +297,46 @@ fn absorb(segs: &mut Vec<Segment>, a: Absorption) {
     let after = a.target > a.sliver;
     let t = if after { a.target - 1 } else { a.target };
     let label = label_of(&sliver);
-    let seconds = span(&sliver).num_seconds();
+    let counted = sliver.counted_span();
+    let seconds = counted.num_seconds();
     let carried = sliver.absorbed_labels;
     let carried_seconds = sliver.smoothed_seconds;
+    let sliver_bridged = sliver.bridged_ms;
+    let (sliver_start, sliver_end) = (sliver.start, sliver.end);
 
     let target = &mut segs[t];
+    // Whatever hole sat between the two is bridged by the absorption, exactly as in ⑥: the block
+    // draws over it and does not count it. `Segment::bridged_ms` says why.
+    let hole = if after {
+        target.start - sliver_end
+    } else {
+        sliver_start - target.end
+    };
+    target.bridged_ms += hole.num_milliseconds() + sliver_bridged;
     if after {
         target.start = sliver.start;
     } else {
         target.end = sliver.end;
     }
     target.smoothed_seconds += seconds + carried_seconds;
+
+    // The sliver's time now counts as the block that swallowed it -- that is what smoothing *is* --
+    // so it joins the target's own share rather than arriving as a share of its own. Keeping it
+    // separate would put a screen in the per-screen panel for an app that is not the block's app.
+    let own_data = target.foreground_slice().data.clone();
+    let add = counted.num_milliseconds();
+    match target
+        .foreground_shares
+        .iter_mut()
+        .find(|e| e.data == own_data)
+    {
+        Some(e) => e.ms += add,
+        // Only reachable if a caller skipped `seed_shares`; recorded rather than dropped.
+        None => target.foreground_shares.push(crate::ForegroundShare {
+            data: own_data,
+            ms: add,
+        }),
+    }
 
     let own = target
         .label_override
@@ -300,6 +394,8 @@ mod tests {
             deliberate_background: Vec::new(),
             smoothed_seconds: 0,
             absorbed_labels: Vec::new(),
+            foreground_shares: Vec::new(),
+            bridged_ms: 0,
         }
     }
 

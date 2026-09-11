@@ -18,9 +18,9 @@ use chrono::{DateTime, Utc};
 use serde_json::{json, Map, Value};
 
 use aw_combined::{
-    activity_label, coalesce, compute_segments, default_min_contention, merge_decisions, parse_line,
-    resolve_bucket_device, smooth, synced_from_hostname, BucketEvents, PipelineInput, Segment,
-    NotCountedRule, SharedRecord, SmoothOptions,
+    activity_label, coalesce, compute_segments, default_min_contention, merge_decisions,
+    parse_line, resolve_bucket_device, smooth, synced_from_hostname, BucketEvents, NotCountedRule,
+    PipelineInput, Segment, SharedRecord, SmoothOptions,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -230,10 +230,16 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
             .get_events(id, Some(req.start), Some(req.end), None)
             .map_err(|e| format!("could not read events from {id}: {e:?}"))?;
         if is_activity {
-            activity.push(BucketEvents { bucket_id: id.clone(), events });
+            activity.push(BucketEvents {
+                bucket_id: id.clone(),
+                events,
+            });
         } else {
             let events = events.into_iter().filter(is_idle).collect();
-            idle.push(BucketEvents { bucket_id: id.clone(), events });
+            idle.push(BucketEvents {
+                bucket_id: id.clone(),
+                events,
+            });
         }
     }
 
@@ -281,7 +287,9 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     // Both are presentation, both are recomputed on every read, and neither touches the datastore.
     let segments = smooth(
         coalesce(compute_segments(input.clone())),
-        SmoothOptions::from_sliver_secs(req.sliver_secs.unwrap_or(aw_combined::DEFAULT_SLIVER_SECS)),
+        SmoothOptions::from_sliver_secs(
+            req.sliver_secs.unwrap_or(aw_combined::DEFAULT_SLIVER_SECS),
+        ),
     );
     // Time the owner said was nobody's counts toward nothing — that is what "I was away" means.
     // Summed as durations and truncated **once**. Per-block `seconds` truncates per block, so
@@ -290,7 +298,9 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     let combined_seconds: i64 = segments
         .iter()
         .filter(|s| !s.ignored)
-        .fold(chrono::Duration::zero(), |acc, s| acc + (s.end - s.start))
+        // `counted_span`, never `end - start`: ⑥ and ⑦ are allowed to draw a block over a hole a
+        // few milliseconds or a second or two wide, and are not allowed to count it (roadmap 4.5c).
+        .fold(chrono::Duration::zero(), |acc, s| acc + s.counted_span())
         .num_seconds();
 
     Ok(json!({
@@ -315,13 +325,46 @@ fn detail(data: &Map<String, Value>) -> Map<String, Value> {
     out
 }
 
+/// The `data` of the activity that held this block longest — [`Segment::dominant_share`], falling
+/// back to the foreground slice for a segment that never went through ⑥.
+fn dominant_data(seg: &Segment) -> &Map<String, Value> {
+    seg.dominant_share()
+        .map(|sh| &sh.data)
+        .unwrap_or_else(|| &seg.foreground_slice().data)
+}
+
+/// What else was running behind the winner, deduplicated by `(device, label)`.
+///
+/// Deduplication became necessary in 4.5c. ⑥ now merges two blocks of the same app whose screens
+/// differ, and the merged block's `active` is the union of both — so the same device appears twice
+/// with the same label, and one of those is the winner. Listing it would have the view say the
+/// owner's app was running in the background behind itself.
+fn background_rows(seg: &Segment) -> Vec<Value> {
+    let fg = seg.foreground_slice();
+    let own = (fg.device.as_str(), label(&fg.data));
+    let mut seen: Vec<(String, String)> = Vec::new();
+    let mut out = Vec::new();
+    for s in seg.background_slices() {
+        let row = (s.device.clone(), label(&s.data));
+        if (row.0.as_str(), row.1.clone()) == own || seen.contains(&row) {
+            continue;
+        }
+        seen.push(row.clone());
+        out.push(json!({ "device": row.0, "label": row.1 }));
+    }
+    out
+}
+
 /// One row of the combined track: what counted, and whether the view must shade it (**R8**).
 fn combined_row(seg: &Segment) -> Value {
     let fg = seg.foreground_slice();
     json!({
         "start": seg.start,
         "end": seg.end,
-        "seconds": (seg.end - seg.start).num_seconds(),
+        // What a watcher actually recorded inside this block, which is not the same as its span:
+        // see `Segment::bridged_ms`. The span is `start`..`end` and is what gets drawn.
+        "seconds": seg.counted_span().num_seconds(),
+        "bridged_seconds": chrono::Duration::milliseconds(seg.bridged_ms).num_seconds(),
         // The owner's own words win over the app name when they gave any (`outcome: relabel`).
         "label": seg.label_override.clone().unwrap_or_else(|| label(&fg.data)),
         "device": fg.device,
@@ -335,12 +378,27 @@ fn combined_row(seg: &Segment) -> Value {
         // platform gives -- and which the combined day had no way to show because this row
         // carried a label and nothing else.
         //
-        // **Exact, not approximate.** ⑥ coalesce only glues two blocks together when the
-        // winning slice's whole `data` map is equal, so a block cannot span two screens: the
-        // moment WhatsApp goes from its home screen to a call, the block ends. The origin tag
-        // is stripped because it is bookkeeping about where the event came from, not about
-        // what the owner was doing, and `device` already says it.
-        "detail": detail(&fg.data),
+        // **The dominant one, with the rest in `shares`.** Until 4.5c this was exact for a
+        // different reason -- ⑥ would only glue two blocks whose winning `data` was equal, so a
+        // block could not span two screens. That exactness is what made the day draw four
+        // Photos blocks in a row where the owner had used Photos once, so ⑥ now merges on the
+        // app and the screens move into `shares` with the time each held. `detail` names the
+        // one that held longest; nothing is lost, and `shares` is what a per-screen panel
+        // should sum. The origin tag is stripped because it is bookkeeping about where the
+        // event came from, not about what the owner was doing, and `device` already says it.
+        "detail": detail(dominant_data(seg)),
+        // Every distinct screen (or window title) inside this block and how long it held.
+        // Fractional seconds on purpose: a block's shares have to add back up to its own
+        // `seconds`, and truncating each one would lose a second per share per block.
+        "shares": seg
+            .foreground_shares
+            .iter()
+            .map(|sh| json!({
+                "detail": detail(&sh.data),
+                "label": label(&sh.data),
+                "seconds": sh.ms as f64 / 1000.0,
+            }))
+            .collect::<Vec<_>>(),
         "ignored": seg.ignored,
         // Roadmap 4.6: ignored because a rule says this never counts, rather than because the
         // owner answered "I was away". The view says different things about the two.
@@ -351,10 +409,7 @@ fn combined_row(seg: &Segment) -> Value {
         // Roadmap 4.5. What ⑦ rounded into this block, so the view can say so.
         "smoothed_seconds": seg.smoothed_seconds,
         "absorbed_labels": seg.absorbed_labels,
-        "background": seg
-            .background_slices()
-            .map(|s| json!({ "device": s.device, "label": label(&s.data) }))
-            .collect::<Vec<_>>(),
+        "background": background_rows(seg),
     })
 }
 
@@ -436,7 +491,12 @@ mod tests {
         let mk = |v: Value| {
             let mut m = Map::new();
             m.insert(AFK_STATUS_KEY.to_string(), v);
-            Event { id: None, timestamp: Utc::now(), duration: chrono::Duration::seconds(1), data: m }
+            Event {
+                id: None,
+                timestamp: Utc::now(),
+                duration: chrono::Duration::seconds(1),
+                data: m,
+            }
         };
         assert!(is_idle(&mk(json!("afk"))));
         assert!(!is_idle(&mk(json!("not-afk"))));

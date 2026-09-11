@@ -30,15 +30,15 @@ mod apply;
 mod attribute;
 mod classify;
 mod coalesce;
-mod exclude;
 pub mod decision;
+mod exclude;
 mod normalise;
 mod segment;
 mod smooth;
 
 pub use coalesce::coalesce;
-pub use exclude::NotCountedRule;
 pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
+pub use exclude::NotCountedRule;
 pub use normalise::{resolve_bucket_device, synced_from_hostname};
 pub use smooth::{smooth, SmoothOptions, DEFAULT_SLIVER_SECS, NOISE_FLOOR_SECS};
 
@@ -109,6 +109,24 @@ pub fn default_min_contention() -> Duration {
     Duration::seconds(DEFAULT_MIN_CONTENTION_SECS)
 }
 
+/// How long a hole between two adjacent blocks may be before it counts as a real gap, in
+/// milliseconds (roadmap 4.5c). Below it, ⑥ and ⑦ treat the two blocks as touching.
+///
+/// **Two seconds, and the number is evidence rather than taste.** On the owner's real day the holes
+/// between adjacent blocks came in two clearly separated populations: watcher jitter, which is
+/// everything from 0ms to about 1.9s and accounts for 314 of 364 adjacent pairs, and real absences,
+/// which start at 8 seconds and run to hours. Nothing measured falls between 2 and 5 seconds. Two
+/// seconds therefore catches the whole jitter population -- including the 1.008s hole between two
+/// One UI Home blocks that the owner pointed at -- without reaching anything that could plausibly
+/// have been time away, and it stays safely under [`NOISE_FLOOR_SECS`], so a bridged hole can never
+/// be longer than a stretch the pipeline would have been willing to call a block of its own.
+pub const JITTER_GAP_MS: i64 = 2_000;
+
+/// [`JITTER_GAP_MS`] as a duration.
+pub fn jitter_gap() -> Duration {
+    Duration::milliseconds(JITTER_GAP_MS)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SegmentState {
@@ -130,6 +148,35 @@ pub struct ActiveSlice {
     /// rule 1 compares (R17): the longest-running originating activity wins the segment, not the
     /// segment's own (identical for every slice) length.
     pub source_end: DateTime<Utc>,
+}
+
+/// How long one distinct foreground activity held part of a block.
+///
+/// A segment straight out of ② has exactly one share: its own `data`, for its whole span. What
+/// makes the type necessary is ⑥ [`coalesce`], which merges neighbouring blocks of the **same app**
+/// even when the finer detail differs -- the screen inside the app on Android, the window title on
+/// a desktop. A stretch of one app is one stretch of that app, and drawing it as four blocks is
+/// what the owner saw on 2026-09-11 and called a repeat:
+///
+/// ```text
+/// 08:17:52  9s  Photos  HomeActivity
+/// 08:18:01  4s  Photos  StoryViewActivity
+/// 08:18:05  4s  Photos  HomeActivity
+/// ```
+///
+/// The detail is not thrown away to achieve that -- it moves here, with the time it held, so the
+/// per-screen panels keep getting exact numbers out of a coarser block.
+///
+/// **Invariant:** a segment's shares always sum to exactly its counted time,
+/// [`Segment::counted_span`].
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ForegroundShare {
+    /// The winning activity's own fields, as ② cut them.
+    pub data: Map<String, Value>,
+    /// Milliseconds, deliberately not seconds. A day is hundreds of blocks and each of them carries
+    /// sub-second parts; truncating per share and summing afterwards loses minutes over a day,
+    /// which is the same mistake roadmap 4.5b had to undo once already for the day total.
+    pub ms: i64,
 }
 
 /// An atomic segment: a maximal time span over which the set of covering [`ActiveSlice`]s does not
@@ -193,6 +240,25 @@ pub struct Segment {
     /// was rounded away. Kept so the view can say what was smoothed rather than let it vanish:
     /// rounding is a display setting, and a display setting that hides things silently is a lie.
     pub absorbed_labels: Vec<String>,
+    /// Every distinct foreground activity inside this block and how long it held, longest first,
+    /// ties broken by the activity's own label so the order is reproducible (**R18**). One entry
+    /// until ⑥ merges something. See [`ForegroundShare`] for why this exists at all.
+    pub foreground_shares: Vec<ForegroundShare>,
+    /// Milliseconds inside this block's span that **no** source segment covered.
+    ///
+    /// A watcher does not hand over a seamless day: between one app's last event and the next
+    /// app's first there is routinely a hole of a few milliseconds, and occasionally of a second or
+    /// two while a transition animation runs and nothing is in the foreground. Measured on the
+    /// owner's real day: of 364 adjacent pairs, 196 met exactly, 73 had a hole under 50ms, and 45
+    /// more had one under 5 seconds. ⑥ and ⑦ treat a hole under [`jitter_gap`] as no hole at all
+    /// (roadmap 4.5c) -- otherwise a day of one app draws as a hundred blocks, and the sliver
+    /// threshold does nothing at all, because a sliver with a 33ms hole on one side has no
+    /// neighbour to be absorbed into.
+    ///
+    /// Bridging one is a **drawing** decision, so the bridged milliseconds are recorded here and
+    /// **never counted**: a block's span may cover time no watcher recorded, but its seconds may
+    /// not. Over the owner's measured day the whole correction is 60 seconds out of 43,969.
+    pub bridged_ms: i64,
 }
 
 impl Segment {
@@ -208,6 +274,18 @@ impl Segment {
             .enumerate()
             .filter(move |(i, _)| *i != self.foreground)
             .map(|(_, s)| s)
+    }
+
+    /// How much of this block's span a watcher actually recorded — its span minus whatever holes ⑥
+    /// or ⑦ bridged to draw it as one block. **This, never `end - start`, is what may be counted.**
+    pub fn counted_span(&self) -> Duration {
+        (self.end - self.start) - Duration::milliseconds(self.bridged_ms)
+    }
+
+    /// The activity that held this block longest — what the view should name it by. `None` only
+    /// before ⑥ has seeded the shares.
+    pub fn dominant_share(&self) -> Option<&ForegroundShare> {
+        self.foreground_shares.first()
     }
 }
 
