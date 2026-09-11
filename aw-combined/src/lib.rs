@@ -177,6 +177,17 @@ pub struct ForegroundShare {
     /// sub-second parts; truncating per share and summing afterwards loses minutes over a day,
     /// which is the same mistake roadmap 4.5b had to undo once already for the day total.
     pub ms: i64,
+    /// Whether these milliseconds are excluded from every total (roadmap 4.6a's *"do not count
+    /// this"*), carried **per share** rather than per block.
+    ///
+    /// This is what lets roadmap 4.5d smooth without lying. The owner's instruction was that
+    /// *"whether it is counted or not counted has nothing to do with the smoothing"* -- a two-second
+    /// detour through the launcher should not split a stretch of Photos into two blocks. But the
+    /// launcher's two seconds must still count toward nothing, or an exclusion the owner set would
+    /// quietly stop working the moment smoothing moved it. Both hold at once only if the flag
+    /// travels with the seconds instead of with the block: ⑦ may put an excluded share inside a
+    /// counted block, and [`Segment::counted_span`] simply does not add it up.
+    pub not_counted: bool,
 }
 
 /// An atomic segment: a maximal time span over which the set of covering [`ActiveSlice`]s does not
@@ -276,10 +287,40 @@ impl Segment {
             .map(|(_, s)| s)
     }
 
-    /// How much of this block's span a watcher actually recorded — its span minus whatever holes ⑥
-    /// or ⑦ bridged to draw it as one block. **This, never `end - start`, is what may be counted.**
+    /// How much of this block **may be counted**: the time a watcher actually recorded, minus the
+    /// holes ⑥ or ⑦ bridged to draw it as one block, minus any share an exclusion rule says counts
+    /// toward nothing. **This, never `end - start`, is what may be added to a total.**
+    ///
+    /// Summed from the shares once ⑥ has seeded them, because after roadmap 4.5d a single block can
+    /// hold both kinds of time: a stretch of Photos that swallowed a two-second launcher sliver
+    /// draws as one block, and those two seconds are inside its span but in none of its totals. The
+    /// shares always account for exactly `span - bridged_ms`, so before seeding — and only then —
+    /// that subtraction is the same answer.
     pub fn counted_span(&self) -> Duration {
-        (self.end - self.start) - Duration::milliseconds(self.bridged_ms)
+        if self.foreground_shares.is_empty() {
+            return (self.end - self.start) - Duration::milliseconds(self.bridged_ms);
+        }
+        Duration::milliseconds(
+            self.foreground_shares
+                .iter()
+                .filter(|sh| !sh.not_counted)
+                .map(|sh| sh.ms)
+                .sum(),
+        )
+    }
+
+    /// The part of this block that counts toward nothing — the mirror of [`counted_span`], so the
+    /// two plus `bridged_ms` always add back up to the drawn span.
+    ///
+    /// [`counted_span`]: Segment::counted_span
+    pub fn uncounted_span(&self) -> Duration {
+        Duration::milliseconds(
+            self.foreground_shares
+                .iter()
+                .filter(|sh| sh.not_counted)
+                .map(|sh| sh.ms)
+                .sum(),
+        )
     }
 
     /// The activity that held this block longest — what the view should name it by. `None` only

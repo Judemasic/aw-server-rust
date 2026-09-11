@@ -404,12 +404,15 @@ fn an_unbracketed_run_between_short_blocks_is_still_left_alone() {
     }
 }
 
-/// Found by measuring the owner's real day against their own `One UI Home` rule: 28 seconds moved
-/// out of the not-counted total and into the day's.
+/// Roadmap 4.5d. The owner's rule: *"whether it is counted or not counted has nothing to do with
+/// the smoothing"* -- a stretch of Photos broken by a short launcher visit should draw as one
+/// stretch of Photos. The constraint that rule must not break: those launcher seconds still count
+/// toward nothing, wherever smoothing puts them.
+///
+/// Both at once, which is the whole point. Measured against the owner's real day, an earlier
+/// version of this moved 28 seconds out of the not-counted total and into the day's.
 #[test]
-fn smoothing_never_moves_a_second_across_the_not_counted_line() {
-    // A block a *rule* emptied carries `ignored` with no `resolved_by`, so comparing decision ids
-    // alone read it as freely joinable with the ordinary block beside it.
+fn an_excluded_sliver_is_drawn_over_but_never_counted() {
     let events = vec![
         event(0, 60_000, "Photos"),
         event(60_014, 68_000, "One UI Home"),
@@ -427,15 +430,15 @@ fn smoothing_never_moves_a_second_across_the_not_counted_line() {
     );
 
     let recorded: i64 = events.iter().map(|e| e.duration.num_milliseconds()).sum();
+    // Summed from the *shares*, not by filtering blocks: after 4.5d a single block can hold both
+    // kinds of time, so the block is the wrong unit to ask.
     let counted: i64 = segs
         .iter()
-        .filter(|s| !s.ignored)
         .map(|s| s.counted_span().num_milliseconds())
         .sum();
     let excluded: i64 = segs
         .iter()
-        .filter(|s| s.ignored)
-        .map(|s| s.counted_span().num_milliseconds())
+        .map(|s| s.uncounted_span().num_milliseconds())
         .sum();
 
     // Every excluded event and nothing else -- summed from the events rather than written out, so
@@ -445,11 +448,28 @@ fn smoothing_never_moves_a_second_across_the_not_counted_line() {
         .filter(|e| e.data["app"] == serde_json::json!("One UI Home"))
         .map(|e| e.duration.num_milliseconds())
         .sum();
-    assert_eq!(excluded, launcher);
+    assert_eq!(excluded, launcher, "an excluded second was counted");
     assert_eq!(counted + excluded, recorded, "the day still adds up");
+
+    // ...and the drawing did change, or the test above would pass on a build that simply refuses to
+    // smooth. The 8s launcher visit sits between two stretches of Photos and is under the 60s
+    // threshold, so the three of them are now one block.
+    let photos: Vec<&aw_combined::Segment> = segs
+        .iter()
+        .filter(|s| labels(std::slice::from_ref(*s)) == vec!["Photos".to_string()])
+        .collect();
+    assert_eq!(
+        photos.len(),
+        1,
+        "the Photos stretch should draw as one block"
+    );
     assert!(
-        segs.iter()
-            .all(|s| s.absorbed_labels.iter().all(|l| l != "One UI Home")),
-        "an excluded block was absorbed into one that counts"
+        photos[0].absorbed_labels.iter().any(|l| l == "One UI Home"),
+        "the block should still say what it swallowed"
+    );
+    assert_eq!(
+        photos[0].uncounted_span().num_milliseconds(),
+        events[1].duration.num_milliseconds(),
+        "the launcher visit is inside the block and in none of its totals"
     );
 }

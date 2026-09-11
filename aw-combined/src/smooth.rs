@@ -138,11 +138,7 @@ fn label_of(seg: &Segment) -> String {
 /// counted sliver was absorbed into an excluded block and vice versa. Smoothing is a drawing
 /// transform and may never move a second across the line between counting and not counting.
 fn joinable(a: &Segment, b: &Segment) -> bool {
-    !a.unresolved
-        && !b.unresolved
-        && a.resolved_by == b.resolved_by
-        && a.ignored == b.ignored
-        && a.not_counted == b.not_counted
+    !a.unresolved && !b.unresolved && a.resolved_by == b.resolved_by
 }
 
 /// Index of the neighbour before `i`, if it is contiguous and joinable.
@@ -337,6 +333,7 @@ fn absorb(segs: &mut Vec<Segment>, a: Absorption) {
     let carried = sliver.absorbed_labels;
     let carried_seconds = sliver.smoothed_seconds;
     let sliver_bridged = sliver.bridged_ms;
+    let sliver_shares = sliver.foreground_shares;
     let (sliver_start, sliver_end) = (sliver.start, sliver.end);
 
     let target = &mut segs[t];
@@ -355,23 +352,41 @@ fn absorb(segs: &mut Vec<Segment>, a: Absorption) {
     }
     target.smoothed_seconds += seconds + carried_seconds;
 
-    // The sliver's time now counts as the block that swallowed it -- that is what smoothing *is* --
-    // so it joins the target's own share rather than arriving as a share of its own. Keeping it
-    // separate would put a screen in the per-screen panel for an app that is not the block's app.
+    // Where the sliver's milliseconds land depends on whether they count the same way the block
+    // does, and *only* on that (roadmap 4.5d).
+    //
+    // Same verdict: they join the block's own share. That is what smoothing is -- the sliver is
+    // being called part of this activity -- and keeping it separate would list a foreign screen in
+    // the per-screen panel for an app that is not the block's app.
+    //
+    // Different verdict: the share stays its own and carries its own flag. The block draws over it,
+    // so a stretch of Photos interrupted by a two-second launcher visit reads as one stretch of
+    // Photos; but `counted_span` walks the shares and never adds that share up, so time the owner
+    // excluded still counts toward nothing wherever smoothing puts it. The owner's rule was that
+    // "whether it is counted or not counted has nothing to do with the smoothing"; keeping the
+    // verdict on the share instead of the block is how that can be true without a total moving.
     let own_data = target.foreground_slice().data.clone();
-    let add = counted.num_milliseconds();
-    match target
-        .foreground_shares
-        .iter_mut()
-        .find(|e| e.data == own_data)
-    {
-        Some(e) => e.ms += add,
-        // Only reachable if a caller skipped `seed_shares`; recorded rather than dropped.
-        None => target.foreground_shares.push(crate::ForegroundShare {
-            data: own_data,
-            ms: add,
-        }),
+    let own_verdict = target.ignored || target.not_counted;
+    for share in sliver_shares {
+        let (data, ms, not_counted) = if share.not_counted == own_verdict {
+            (own_data.clone(), share.ms, own_verdict)
+        } else {
+            (share.data, share.ms, share.not_counted)
+        };
+        match target
+            .foreground_shares
+            .iter_mut()
+            .find(|e| e.data == data && e.not_counted == not_counted)
+        {
+            Some(e) => e.ms += ms,
+            None => target.foreground_shares.push(crate::ForegroundShare {
+                data,
+                ms,
+                not_counted,
+            }),
+        }
     }
+    crate::coalesce::sort_shares(&mut target.foreground_shares);
 
     let own = target
         .label_override

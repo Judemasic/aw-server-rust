@@ -297,10 +297,23 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     // both round down -- which showed up as the day's total shrinking by 1s at a 60s threshold.
     let combined_seconds: i64 = segments
         .iter()
-        .filter(|s| !s.ignored)
         // `counted_span`, never `end - start`: ⑥ and ⑦ are allowed to draw a block over a hole a
         // few milliseconds or a second or two wide, and are not allowed to count it (roadmap 4.5c).
+        //
+        // No `filter` on `ignored` any more, because after 4.5d the block is the wrong unit to ask.
+        // Smoothing may draw an excluded sliver inside a counted block and a counted sliver inside
+        // an excluded one, so what counts is a property of the *shares*; `counted_span` sums exactly
+        // the ones that count and nothing else, in both directions.
         .fold(chrono::Duration::zero(), |acc, s| acc + s.counted_span())
+        .num_seconds();
+
+    // The mirror of `combined_seconds`: everything an exclusion rule (or an "I was away" answer)
+    // said counts toward nothing. Roadmap 4.6b's panel could only ever say "not measured on this
+    // page" on the combined day, because the day's own response never carried this figure -- so an
+    // exclusion the owner set was invisible in exactly the view that draws it.
+    let excluded_seconds: i64 = segments
+        .iter()
+        .fold(chrono::Duration::zero(), |acc, s| acc + s.uncounted_span())
         .num_seconds();
 
     Ok(json!({
@@ -308,6 +321,7 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         "end": req.end,
         "own_device": req.own_device,
         "combined_seconds": combined_seconds,
+        "excluded_seconds": excluded_seconds,
         "combined": segments.iter().map(combined_row).collect::<Vec<_>>(),
         "devices": devices,
     }))
@@ -365,6 +379,9 @@ fn combined_row(seg: &Segment) -> Value {
         // see `Segment::bridged_ms`. The span is `start`..`end` and is what gets drawn.
         "seconds": seg.counted_span().num_seconds(),
         "bridged_seconds": chrono::Duration::milliseconds(seg.bridged_ms).num_seconds(),
+        // Time drawn inside this block that counts toward nothing (roadmap 4.5d). Non-zero only
+        // where smoothing put a share of the other kind inside it.
+        "uncounted_seconds": seg.uncounted_span().num_milliseconds() as f64 / 1000.0,
         // The owner's own words win over the app name when they gave any (`outcome: relabel`).
         "label": seg.label_override.clone().unwrap_or_else(|| label(&fg.data)),
         "device": fg.device,
@@ -397,6 +414,11 @@ fn combined_row(seg: &Segment) -> Value {
                 "detail": detail(&sh.data),
                 "label": label(&sh.data),
                 "seconds": sh.ms as f64 / 1000.0,
+                // Roadmap 4.5d: a share inside a counted block that still counts toward nothing,
+                // or the reverse. The view marks it rather than hiding it -- the owner has to be
+                // able to see that the launcher second inside this stretch of Photos is not in
+                // the total, or the exclusion they set becomes invisible.
+                "not_counted": sh.not_counted,
             }))
             .collect::<Vec<_>>(),
         "ignored": seg.ignored,

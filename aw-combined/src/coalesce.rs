@@ -42,9 +42,14 @@ pub(crate) fn seed_shares(segments: &mut [Segment]) {
     for seg in segments.iter_mut() {
         if seg.foreground_shares.is_empty() {
             let ms = (seg.end - seg.start).num_milliseconds() - seg.bridged_ms;
+            // The block's own verdict becomes the share's, once, here. From this point on it is the
+            // *share* that knows whether its milliseconds count, which is what lets ⑦ move one into
+            // a block of the other kind without changing any total. See `ForegroundShare`.
+            let not_counted = seg.ignored || seg.not_counted;
             seg.foreground_shares.push(ForegroundShare {
                 data: seg.foreground_slice().data.clone(),
                 ms,
+                not_counted,
             });
         }
     }
@@ -52,9 +57,12 @@ pub(crate) fn seed_shares(segments: &mut [Segment]) {
 
 /// Longest first, ties broken by the activity's own label and then by its serialised fields, so two
 /// devices holding the same day produce the same order (**R18**).
-fn sort_shares(shares: &mut [ForegroundShare]) {
+pub(crate) fn sort_shares(shares: &mut [ForegroundShare]) {
     shares.sort_by(|a, b| {
         b.ms.cmp(&a.ms)
+            // A share that counts outranks one that does not at equal length, so a block absorbing a
+            // same-length excluded sliver is still named after the part of it that counted.
+            .then_with(|| a.not_counted.cmp(&b.not_counted))
             .then_with(|| activity_label(&a.data).cmp(&activity_label(&b.data)))
             .then_with(|| {
                 // Last-resort tiebreak so the order is total. `Map` is a `BTreeMap` here (no
@@ -166,7 +174,7 @@ fn merge_into(prev: &mut Segment, next: Segment) {
         match prev
             .foreground_shares
             .iter_mut()
-            .find(|e| e.data == share.data)
+            .find(|e| e.data == share.data && e.not_counted == share.not_counted)
         {
             Some(e) => e.ms += share.ms,
             None => prev.foreground_shares.push(share),
