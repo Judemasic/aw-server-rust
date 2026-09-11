@@ -34,6 +34,38 @@ use aw_models::Event;
 /// tab-level detail in the combined track.
 const ACTIVITY_TYPE: &str = "currentwindow";
 
+/// Bucket types that say *what* the owner was doing, and never *which device was counting*.
+///
+/// These are the buckets [`ACTIVITY_TYPE`]'s doc comment declines to put into contention, and for
+/// the same reason: a browser tab overlaps its own window for the same instants, so a tab that
+/// competed with a window would let a tab title win the combined track. That argument is about
+/// *contention* only. It was read as "the combined day cannot answer these at all", which is why
+/// the browser, editor and clock panels were marked unavailable there -- the owner's whole day was
+/// in the app and the question "what was I reading?" had no answer on the one screen that shows
+/// the whole day.
+///
+/// So they are read, and they are never activity. Each one's events are intersected with the time
+/// its *own* device actually counted for, which is the part a per-device view cannot do: a phone's
+/// browsing while the desktop held the foreground is real browsing that is not part of the
+/// combined day, and a per-device browser panel has always counted it anyway.
+const DETAIL_TYPES: [&str; 3] = [
+    "web.tab.current",
+    "app.editor.activity",
+    "general.stopwatch",
+];
+
+/// The clock, which is masked differently -- see [`detail_rows`].
+const STOPWATCH_TYPE: &str = "general.stopwatch";
+
+/// How many rows of one detail type the response will carry.
+///
+/// A day of browsing is thousands of distinct URLs and a panel shows ten. The cap is generous
+/// rather than tight because the view groups these again -- URLs into domains, files into projects
+/// -- and a cap applied before grouping would quietly drop the tail of a domain that is large only
+/// once its URLs are added together. Rows are cut from the short end, so what is lost is always
+/// the least of it.
+const MAX_DETAIL_ROWS: usize = 500;
+
 /// The bucket type carrying AFK status. Absent on Android — `aw-watcher-android` only records
 /// while the screen is on and in use — but a synced desktop peer's afk bucket arrives through the
 /// same datastore, and `aw-combined`'s idle contract wants only the genuinely-idle events.
@@ -219,11 +251,14 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
 
     let mut activity: Vec<BucketEvents> = Vec::new();
     let mut idle: Vec<BucketEvents> = Vec::new();
+    // Read in the same pass, kept apart from `activity` so nothing about contention changes.
+    let mut detail: Vec<(String, BucketEvents)> = Vec::new();
     for id in ids {
         let bucket = &buckets[id];
         let is_activity = bucket._type == ACTIVITY_TYPE;
         let is_afk = bucket._type == AFK_TYPE;
-        if !is_activity && !is_afk {
+        let is_detail = DETAIL_TYPES.contains(&bucket._type.as_str());
+        if !is_activity && !is_afk && !is_detail {
             continue;
         }
         let events = ds
@@ -234,12 +269,20 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
                 bucket_id: id.clone(),
                 events,
             });
-        } else {
+        } else if is_afk {
             let events = events.into_iter().filter(is_idle).collect();
             idle.push(BucketEvents {
                 bucket_id: id.clone(),
                 events,
             });
+        } else {
+            detail.push((
+                bucket._type.clone(),
+                BucketEvents {
+                    bucket_id: id.clone(),
+                    events,
+                },
+            ));
         }
     }
 
@@ -324,6 +367,10 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         "excluded_seconds": excluded_seconds,
         "combined": segments.iter().map(combined_row).collect::<Vec<_>>(),
         "devices": devices,
+        // What the owner was reading, editing and timing during the stretches that counted.
+        // Keyed by bucket type, because the view already knows what a `web.tab.current` event
+        // holds and there is no gain in re-teaching the server.
+        "details": detail_rows(&detail, &input, &counted_intervals(&segments), req),
     }))
 }
 
@@ -435,6 +482,154 @@ fn combined_row(seg: &Segment) -> Value {
     })
 }
 
+/// A half-open span of time, as the mask uses it.
+type Span = (DateTime<Utc>, DateTime<Utc>);
+
+/// For each device, the stretches of the day the combined track gave it, merged and sorted.
+///
+/// This is the whole point of putting browser and editor data on the combined day rather than
+/// leaving it to the per-device pages. A per-device browser panel counts every second the browser
+/// was in front on *that* device, including the hours the combined day awarded to a different
+/// device entirely. Intersecting with the mask answers the question the combined day actually
+/// asks: not "what did this device's browser see today", but "what was I reading, during the time
+/// that counted as mine".
+///
+/// **Blocks, not shares.** A block whose `counted_span` is zero contributes nothing; anything else
+/// contributes its whole span. Shares carry the `not_counted` flag at a finer grain (4.5d) but
+/// carry no times of their own, so a sliver of excluded time that ⑦ drew inside a counted block is
+/// inside the mask. That sliver is bounded by the smoothing threshold -- seconds, against a day --
+/// and the alternative is to give shares timestamps they do not have. Worth revisiting if
+/// smoothing ever runs at minutes.
+fn counted_intervals(segments: &[Segment]) -> HashMap<String, Vec<Span>> {
+    let mut by_device: HashMap<String, Vec<Span>> = HashMap::new();
+    for seg in segments {
+        if seg.counted_span().num_milliseconds() <= 0 {
+            continue;
+        }
+        by_device
+            .entry(seg.foreground_slice().device.clone())
+            .or_default()
+            .push((seg.start, seg.end));
+    }
+    for spans in by_device.values_mut() {
+        spans.sort();
+        // Merge touching and overlapping spans, so an event crossing a block boundary is not
+        // counted once per block it touches.
+        let mut merged: Vec<Span> = Vec::with_capacity(spans.len());
+        for (start, end) in spans.drain(..) {
+            match merged.last_mut() {
+                Some(last) if start <= last.1 => {
+                    if end > last.1 {
+                        last.1 = end;
+                    }
+                }
+                _ => merged.push((start, end)),
+            }
+        }
+        *spans = merged;
+    }
+    by_device
+}
+
+/// Milliseconds of `event` that fall inside `mask`.
+fn overlap_ms(event: &Event, mask: &[Span]) -> i64 {
+    let start = event.timestamp;
+    let end = start + event.duration;
+    let mut total = 0;
+    for (ms, me) in mask {
+        // The mask is sorted, so once a span starts after this event ends, so does every one after.
+        if *ms >= end {
+            break;
+        }
+        let from = if *ms > start { *ms } else { start };
+        let to = if *me < end { *me } else { end };
+        if to > from {
+            total += (to - from).num_milliseconds();
+        }
+    }
+    total
+}
+
+/// The browser, editor and clock rows for a combined day, keyed by bucket type.
+///
+/// Grouped by the event's whole `data` rather than by a chosen key. Grouping by domain, by file or
+/// by language is the view's business -- it has to group them anyway, since the same URL arrives
+/// from two devices as two rows -- and picking keys here would mean the server deciding, per
+/// watcher, which fields matter. A watcher this code has never heard of then reaches the day whole
+/// rather than gutted, which is the same reasoning `detail` on a block already follows.
+///
+/// **The clock is not masked.** A stopwatch event is not a measurement of a device: it is the
+/// owner starting and stopping a timer, over a span they chose, and there is no sense in which
+/// another device winning the foreground makes ten minutes of it not have happened. Clipping it to
+/// the requested range is right -- that is what the day is -- and masking it is not.
+fn detail_rows(
+    buckets: &[(String, BucketEvents)],
+    input: &PipelineInput,
+    mask: &HashMap<String, Vec<Span>>,
+    req: &TimelineRequest,
+) -> Value {
+    // type -> canonical data -> (data, milliseconds)
+    let mut by_type: HashMap<&str, HashMap<String, (Map<String, Value>, i64)>> = HashMap::new();
+    let day: [Span; 1] = [(req.start, req.end)];
+
+    for (bucket_type, bucket) in buckets {
+        let device = resolve_bucket_device(&bucket.events, &bucket.bucket_id, input);
+        let empty: Vec<Span> = Vec::new();
+        let spans: &[Span] = if bucket_type == STOPWATCH_TYPE {
+            &day
+        } else {
+            mask.get(&device).unwrap_or(&empty)
+        };
+        if spans.is_empty() {
+            continue; // this device never held the foreground today
+        }
+        let rows = by_type.entry(bucket_type.as_str()).or_default();
+        for event in &bucket.events {
+            let ms = overlap_ms(event, spans);
+            if ms <= 0 {
+                continue;
+            }
+            let data = detail(&event.data);
+            // `Map` is a `BTreeMap` here, so its `to_string` is already one canonical spelling --
+            // the same property `store_record` relies on.
+            let key = Value::Object(data.clone()).to_string();
+            let row = rows.entry(key).or_insert_with(|| (data, 0));
+            row.1 += ms;
+        }
+    }
+
+    let mut out = Map::new();
+    for (bucket_type, rows) in by_type {
+        let mut rows: Vec<(Map<String, Value>, i64)> = rows.into_values().collect();
+        // Longest first, and ties broken by the data itself so two identical durations do not
+        // swap places between two reads of the same day (**R18**).
+        rows.sort_by(|a, b| {
+            b.1.cmp(&a.1).then_with(|| {
+                Value::Object(a.0.clone())
+                    .to_string()
+                    .cmp(&Value::Object(b.0.clone()).to_string())
+            })
+        });
+        rows.truncate(MAX_DETAIL_ROWS);
+        out.insert(
+            bucket_type.to_string(),
+            Value::Array(
+                rows.into_iter()
+                    .map(|(data, ms)| {
+                        json!({
+                            "data": data,
+                            // Fractional, for the same reason a block's shares are: a day is
+                            // hundreds of rows and truncating each one loses minutes.
+                            "seconds": ms as f64 / 1000.0,
+                        })
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+        );
+    }
+    Value::Object(out)
+}
+
 /// The raw per-device rows, sorted by device uuid so the output is stable (**R18**).
 fn device_tracks(input: &PipelineInput) -> Vec<Value> {
     // device -> (rows, total seconds). Rows keep bucket order, which is sorted-id order.
@@ -506,6 +701,221 @@ mod tests {
         m.insert("app".to_string(), json!(""));
         m.insert("title".to_string(), json!("fallback"));
         assert_eq!(label(&m), "fallback");
+    }
+
+    fn at(minute: i64) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339("2026-09-11T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc)
+            + chrono::Duration::minutes(minute)
+    }
+
+    fn event(from: i64, to: i64, data: Map<String, Value>) -> Event {
+        Event {
+            id: None,
+            timestamp: at(from),
+            duration: chrono::Duration::minutes(to - from),
+            data,
+        }
+    }
+
+    fn page(url: &str) -> Map<String, Value> {
+        let mut m = Map::new();
+        m.insert("url".to_string(), json!(url));
+        m
+    }
+
+    #[test]
+    fn overlap_counts_only_the_part_inside_the_mask() {
+        let mask = vec![(at(10), at(20))];
+        // Straddling the start, straddling the end, wholly inside, wholly outside.
+        assert_eq!(overlap_ms(&event(5, 15, page("a")), &mask), 5 * 60_000);
+        assert_eq!(overlap_ms(&event(15, 25, page("a")), &mask), 5 * 60_000);
+        assert_eq!(overlap_ms(&event(12, 18, page("a")), &mask), 6 * 60_000);
+        assert_eq!(overlap_ms(&event(30, 40, page("a")), &mask), 0);
+    }
+
+    #[test]
+    fn overlap_adds_up_across_separate_stretches() {
+        // A browser left open across a gap the combined day gave to another device: both ends
+        // count, the middle does not.
+        let mask = vec![(at(0), at(10)), (at(20), at(30))];
+        assert_eq!(overlap_ms(&event(0, 30, page("a")), &mask), 20 * 60_000);
+    }
+
+    #[test]
+    fn overlap_of_a_zero_length_event_is_zero() {
+        let mask = vec![(at(0), at(10))];
+        assert_eq!(overlap_ms(&event(5, 5, page("a")), &mask), 0);
+    }
+
+    fn input_for(own: &str) -> PipelineInput {
+        PipelineInput {
+            own_device: own.to_string(),
+            hostname_to_uuid: HashMap::new(),
+            activity: Vec::new(),
+            idle: Vec::new(),
+            min_contention: default_min_contention(),
+            decisions: Vec::new(),
+            not_counted: Vec::new(),
+        }
+    }
+
+    fn request() -> TimelineRequest {
+        TimelineRequest {
+            start: at(0),
+            end: at(60),
+            own_device: "me".to_string(),
+            hostname_to_uuid: HashMap::new(),
+            own_hostname: "my-host".to_string(),
+            sliver_secs: None,
+        }
+    }
+
+    fn browser_bucket(id: &str, events: Vec<Event>) -> (String, BucketEvents) {
+        (
+            "web.tab.current".to_string(),
+            BucketEvents {
+                bucket_id: id.to_string(),
+                events,
+            },
+        )
+    }
+
+    #[test]
+    fn a_page_is_counted_only_while_its_device_held_the_day() {
+        // Half an hour of one page, of which the combined day gave this device ten minutes.
+        let buckets = vec![browser_bucket(
+            "aw-watcher-web-firefox_my-host",
+            vec![event(0, 30, page("https://example.com/a"))],
+        )];
+        let mut mask = HashMap::new();
+        mask.insert("me".to_string(), vec![(at(5), at(15))]);
+
+        let out = detail_rows(&buckets, &input_for("me"), &mask, &request());
+        let rows = out["web.tab.current"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["data"]["url"], json!("https://example.com/a"));
+        assert_eq!(rows[0]["seconds"], json!(600.0));
+    }
+
+    #[test]
+    fn a_device_that_never_counted_contributes_no_browsing() {
+        // The point of the mask: a phone browsing while the desktop held the day is real
+        // browsing that is not part of this day, and the per-device panel counts it anyway.
+        let buckets = vec![browser_bucket(
+            "aw-watcher-web-firefox_their-host-synced-from-their-host",
+            vec![event(0, 30, page("https://example.com/a"))],
+        )];
+        let mut mask = HashMap::new();
+        mask.insert("me".to_string(), vec![(at(0), at(60))]);
+
+        let out = detail_rows(&buckets, &input_for("me"), &mask, &request());
+        assert!(
+            out.get("web.tab.current").is_none(),
+            "a device with no counted time still reached the day: {out}"
+        );
+    }
+
+    #[test]
+    fn the_same_page_from_two_devices_becomes_one_row() {
+        let mut input = input_for("me");
+        input
+            .hostname_to_uuid
+            .insert("their-host".to_string(), "them".to_string());
+        let buckets = vec![
+            browser_bucket("aw-watcher-web-firefox", vec![event(0, 10, page("same"))]),
+            browser_bucket(
+                "aw-watcher-web-firefox-synced-from-their-host",
+                vec![event(20, 25, page("same"))],
+            ),
+        ];
+        let mut mask = HashMap::new();
+        mask.insert("me".to_string(), vec![(at(0), at(10))]);
+        mask.insert("them".to_string(), vec![(at(20), at(25))]);
+
+        let out = detail_rows(&buckets, &input, &mask, &request());
+        let rows = out["web.tab.current"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "two devices, two rows: {rows:?}");
+        assert_eq!(rows[0]["seconds"], json!(900.0));
+    }
+
+    #[test]
+    fn rows_come_back_longest_first() {
+        let buckets = vec![browser_bucket(
+            "aw-watcher-web-firefox",
+            vec![
+                event(0, 5, page("short")),
+                event(5, 25, page("long")),
+                event(25, 35, page("middle")),
+            ],
+        )];
+        let mut mask = HashMap::new();
+        mask.insert("me".to_string(), vec![(at(0), at(60))]);
+
+        let out = detail_rows(&buckets, &input_for("me"), &mask, &request());
+        let urls: Vec<&str> = out["web.tab.current"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["data"]["url"].as_str().unwrap())
+            .collect();
+        assert_eq!(urls, vec!["long", "middle", "short"]);
+    }
+
+    #[test]
+    fn the_clock_is_not_masked() {
+        // A stopwatch event is the owner starting and stopping a timer, not a measurement of a
+        // device. Another device winning the foreground does not un-happen ten minutes of it.
+        let mut data = Map::new();
+        data.insert("label".to_string(), json!("reading"));
+        data.insert("running".to_string(), json!(false));
+        let buckets = vec![(
+            "general.stopwatch".to_string(),
+            BucketEvents {
+                bucket_id: "aw-stopwatch".to_string(),
+                events: vec![event(0, 10, data)],
+            },
+        )];
+        // Nobody counted anything at all today.
+        let out = detail_rows(&buckets, &input_for("me"), &HashMap::new(), &request());
+        let rows = out["general.stopwatch"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["seconds"], json!(600.0));
+    }
+
+    #[test]
+    fn the_clock_is_still_clipped_to_the_day() {
+        let mut data = Map::new();
+        data.insert("label".to_string(), json!("reading"));
+        let buckets = vec![(
+            "general.stopwatch".to_string(),
+            BucketEvents {
+                bucket_id: "aw-stopwatch".to_string(),
+                // A timer running from before this day into it.
+                events: vec![event(-30, 10, data)],
+            },
+        )];
+        let out = detail_rows(&buckets, &input_for("me"), &HashMap::new(), &request());
+        assert_eq!(out["general.stopwatch"][0]["seconds"], json!(600.0));
+    }
+
+    #[test]
+    fn the_origin_tag_does_not_split_a_row() {
+        // Two devices' copies of the same page differ by the tag this crate added, which is
+        // bookkeeping about where an event came from and not about what the owner was doing.
+        let mut theirs = page("same");
+        theirs.insert(aw_combined::EVENT_ORIGIN_KEY.to_string(), json!("them"));
+        let buckets = vec![
+            browser_bucket("aw-watcher-web-firefox", vec![event(0, 10, page("same"))]),
+            browser_bucket("aw-watcher-web-other", vec![event(10, 20, theirs)]),
+        ];
+        let mut mask = HashMap::new();
+        mask.insert("me".to_string(), vec![(at(0), at(10))]);
+        mask.insert("them".to_string(), vec![(at(10), at(20))]);
+
+        let out = detail_rows(&buckets, &input_for("me"), &mask, &request());
+        assert_eq!(out["web.tab.current"].as_array().unwrap().len(), 1);
     }
 
     #[test]
