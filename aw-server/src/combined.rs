@@ -303,6 +303,18 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
     }))
 }
 
+/// One winning activity's `data`, minus the tagging this crate added.
+///
+/// Returned whole rather than as a hand-picked set of keys: the combined track's shortcoming has
+/// always been that a segment "carries an app label and nothing finer", and picking three keys
+/// today only moves the same wall three keys further out. What a panel can do with a field is the
+/// view's business.
+fn detail(data: &Map<String, Value>) -> Map<String, Value> {
+    let mut out = data.clone();
+    out.remove(aw_combined::EVENT_ORIGIN_KEY);
+    out
+}
+
 /// One row of the combined track: what counted, and whether the view must shade it (**R8**).
 fn combined_row(seg: &Segment) -> Value {
     let fg = seg.foreground_slice();
@@ -318,6 +330,17 @@ fn combined_row(seg: &Segment) -> Value {
         "absorbed_short_contention": seg.absorbed_short_contention,
         "resolved_by": seg.resolved_by,
         "auto_resolved": seg.auto_resolved,
+        // What the winning activity was, beyond its name (roadmap 4.4i). On Android that is
+        // `classname`, the screen inside the app, which is the only per-screen detail the
+        // platform gives -- and which the combined day had no way to show because this row
+        // carried a label and nothing else.
+        //
+        // **Exact, not approximate.** ⑥ coalesce only glues two blocks together when the
+        // winning slice's whole `data` map is equal, so a block cannot span two screens: the
+        // moment WhatsApp goes from its home screen to a call, the block ends. The origin tag
+        // is stripped because it is bookkeeping about where the event came from, not about
+        // what the owner was doing, and `device` already says it.
+        "detail": detail(&fg.data),
         "ignored": seg.ignored,
         // Roadmap 4.6: ignored because a rule says this never counts, rather than because the
         // owner answered "I was away". The view says different things about the two.
