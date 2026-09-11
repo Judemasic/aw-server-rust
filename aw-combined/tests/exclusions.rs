@@ -16,6 +16,7 @@ use serde_json::{json, Map};
 
 const PHONE: &str = "11111111-1111-1111-1111-111111111111";
 const TABLET: &str = "22222222-2222-2222-2222-222222222222";
+const LAPTOP: &str = "33333333-3333-3333-3333-333333333333";
 
 fn t(min: i64) -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 10, 10, 0, 0).unwrap() + Duration::minutes(min)
@@ -221,4 +222,83 @@ fn excluding_one_of_three_leaves_the_other_two_contending() {
         "the launcher is gone, the real two remain"
     );
     assert_eq!(counted(&segments), 30 * 60);
+}
+
+/// The owner's machine, 2026-09-11: one contended stretch drawn as ten questions.
+///
+/// The shape measured there, reproduced: a stretch that stays **contended throughout** -- two
+/// devices are genuinely competing the whole time -- while a *third* device dips into its launcher
+/// in the middle. The rule eats the launcher, so the dip changes nothing about who is competing or
+/// who wins; all it changes is `excluded_labels`, which `mergeable` used to compare.
+///
+/// So one unanswered overlap drew as three blocks and asked three times. Across the owner's real
+/// day that turned 39 overlaps into 70 questions, one of them ten blocks long -- answering moved
+/// the count by one, and the same overlap came back: *"i do one then astill 72 then i don one to
+/// move to 71 some of the i have to do twivcce"*.
+#[test]
+fn a_launcher_dip_does_not_split_a_stretch_that_stays_contended() {
+    let activity = vec![
+        // Two devices competing for the whole half hour: this is one overlap, start to finish.
+        bucket(
+            "aw-watcher-window_tablet",
+            vec![ev(0, 30, TABLET, "Kindle")],
+        ),
+        bucket(
+            "aw-watcher-window_laptop",
+            vec![ev(0, 30, LAPTOP, "Firefox")],
+        ),
+        // A third device, asleep except for two minutes on its launcher.
+        bucket(
+            "aw-watcher-android_phone",
+            vec![ev(10, 12, PHONE, "One UI Home")],
+        ),
+    ];
+
+    let segments = run(activity, vec![launcher_rule()]);
+
+    assert_eq!(
+        segments.len(),
+        1,
+        "one overlap must be one question, got {} blocks: {:?}",
+        segments.len(),
+        segments
+            .iter()
+            .map(|s| (s.start.to_rfc3339(), s.state, s.excluded_labels.clone()))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(segments[0].state, SegmentState::Contended);
+    assert!(segments[0].unresolved, "it is still an unanswered overlap");
+    assert_eq!(
+        segments[0].excluded_labels,
+        vec!["One UI Home".to_string()],
+        "what the rule took out is unioned onto the merged block, not compared"
+    );
+    // A merge moves no time.
+    assert_eq!(counted(&segments), 30 * 60);
+}
+
+/// A block a rule emptied *entirely* still stands apart, which is the case `excluded_labels` was
+/// wrongly standing in for.
+#[test]
+fn a_stretch_the_rule_emptied_does_not_merge_with_one_it_did_not() {
+    let activity = vec![bucket(
+        "aw-watcher-android_phone",
+        vec![
+            ev(0, 10, PHONE, "Kindle"),
+            // Nothing but the launcher: this stretch counts toward nothing.
+            ev(10, 20, PHONE, "One UI Home"),
+            ev(20, 30, PHONE, "Kindle"),
+        ],
+    )];
+
+    let segments = run(activity, vec![launcher_rule()]);
+
+    assert_eq!(segments.len(), 3, "{segments:?}");
+    assert!(!segments[0].not_counted);
+    assert!(
+        segments[1].not_counted,
+        "the launcher-only stretch counts toward nothing"
+    );
+    assert!(!segments[2].not_counted);
+    assert_eq!(counted(&segments), 20 * 60, "only the Kindle time counts");
 }

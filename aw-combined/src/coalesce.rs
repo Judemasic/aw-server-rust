@@ -90,11 +90,28 @@ pub(crate) fn sort_shares(shares: &mut [ForegroundShare]) {
 /// - `prev.absorbed_short_contention == next.absorbed_short_contention`;
 /// - every field ④ writes is equal — same decision id, same rule flag, same relabel, same
 ///   `ignored`, same deliberate-background set;
-/// - every field ②b writes is equal, so a block a rule emptied never merges with one it did not.
+/// - `ignored` and `not_counted` are equal, so a block a rule emptied never merges with one it did
+///   not.
 ///
 /// ⑦'s smoothing bookkeeping (`smoothed_seconds`, `absorbed_labels`) is **not** compared: it is a
 /// footnote about what was rounded away, and two otherwise-identical stretches must not be held
 /// apart by one. The merged segment sums the seconds and unions the labels.
+///
+/// **`excluded_labels` is not compared either, and that took a real day to notice.** It is the same
+/// kind of footnote -- what ②b took *out* of a block -- but it was in the comparison, and the
+/// effect was ugly in a way nothing about the code suggested. On the owner's machine one 25-minute
+/// contended stretch of the same app on the same device drew as **ten** blocks, because now and
+/// then the *losing* device dipped into its launcher, which a not-counted rule eats. Three of them
+/// differed from their neighbours in nothing but `excluded_labels: ["One UI Home"]`.
+///
+/// Each of those blocks is a separate unanswered overlap, so the owner was asked the same question
+/// ten times for one overlap, and answering one moved the count by one: *"i do one then astill 72
+/// then i don one to move to 71 some of the i have to do twivcce"*. Across their day, 70 unresolved
+/// blocks were 39 actual overlaps.
+///
+/// What a rule removed from the *background* says nothing about who the block belongs to, which is
+/// what a merge is about. Where it does matter -- a block a rule emptied entirely -- `ignored` and
+/// `not_counted` are both set, both compared, and both still hold those blocks apart.
 ///
 /// The merged segment takes `start` from `prev`, `end` from `next`, carries the flags over, and its
 /// `active` is the union of both slice lists deduplicated by `(device, bucket_id, data)` and
@@ -134,7 +151,6 @@ fn mergeable(prev: &Segment, next: &Segment) -> bool {
         && prev.label_override == next.label_override
         && prev.ignored == next.ignored
         && prev.not_counted == next.not_counted
-        && prev.excluded_labels == next.excluded_labels
         && prev.deliberate_background == next.deliberate_background
         && {
             let (p, n) = (prev.foreground_slice(), next.foreground_slice());
@@ -166,6 +182,15 @@ fn merge_into(prev: &mut Segment, next: Segment) {
         }
     }
     prev.absorbed_labels.sort();
+
+    // Unioned, not compared -- see `mergeable`. The merged block was stripped of everything either
+    // half was stripped of, and the view lists them to explain a competitor that vanished.
+    for l in next.excluded_labels {
+        if !prev.excluded_labels.contains(&l) {
+            prev.excluded_labels.push(l);
+        }
+    }
+    prev.excluded_labels.sort();
 
     // The two blocks are the same app but not necessarily the same screen, so the shares are summed
     // per distinct activity rather than replaced. This is the whole reason the merge is allowed to
