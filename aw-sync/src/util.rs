@@ -77,9 +77,105 @@ pub fn host_for_url(host: &str) -> String {
 
 #[cfg(all(test, not(target_os = "android")))]
 mod tests {
-    use super::{get_server_config, host_for_url, is_loopback_host, origin_from_db_path};
+    use super::{
+        find_remotes_nonlocal, get_server_config, host_for_url, is_loopback_host,
+        origin_from_db_path,
+    };
     use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// A scratch directory that cleans up after itself, so these tests leave no sync folders behind.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "aw-sync-{}-{}-{}",
+            tag,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn touch_db(path: &PathBuf) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"").unwrap();
+    }
+
+    /// The shape a phone actually leaves in the shared folder, against the shape a desktop does.
+    ///
+    /// Android copies its tree out as `<root>/<hostname>/<device id>/test.db`, a desktop writes
+    /// `<root>/<device id>/test.db`. Reading only one level meant a PC sharing a folder with a
+    /// phone found nothing at all, while the phone found the PC -- sync that looks fine from one
+    /// end and is empty at the other.
+    #[test]
+    fn finds_peers_at_both_depths() {
+        let root = scratch_dir("depths");
+        let desktop = root.join("desktop-uuid").join("test.db");
+        let phone = root
+            .join("jude_s_s25_ultra")
+            .join("phone-uuid")
+            .join("test.db");
+        touch_db(&desktop);
+        touch_db(&phone);
+
+        let found = find_remotes_nonlocal(&root, "nobody", None);
+        assert!(found.contains(&desktop), "desktop layout missed: {found:?}");
+        assert!(found.contains(&phone), "android layout missed: {found:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn leaves_out_this_device_at_either_depth() {
+        let root = scratch_dir("own");
+        let own_flat = root.join("me").join("test.db");
+        let own_nested = root.join("my-host").join("me").join("test.db");
+        let theirs = root.join("them").join("test.db");
+        touch_db(&own_flat);
+        touch_db(&own_nested);
+        touch_db(&theirs);
+
+        let found = find_remotes_nonlocal(&root, "me", None);
+        assert_eq!(
+            found,
+            vec![theirs.clone()],
+            "own remote came back: {found:?}"
+        );
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn ignores_a_database_lying_loose_at_the_root() {
+        // The directory holding a database *is* the device that wrote it, so one with no
+        // directory cannot be attributed to anybody.
+        let root = scratch_dir("loose");
+        touch_db(&root.join("stray.db"));
+        let real = root.join("them").join("test.db");
+        touch_db(&real);
+
+        let found = find_remotes_nonlocal(&root, "me", None);
+        assert_eq!(found, vec![real.clone()]);
+
+        fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn does_not_follow_a_shared_folder_all_the_way_down() {
+        // The folder belongs to whoever else is in it too; a database four levels down is
+        // somebody else's business, not a peer.
+        let root = scratch_dir("deep");
+        touch_db(&root.join("a").join("b").join("c").join("test.db"));
+
+        let found = find_remotes_nonlocal(&root, "me", None);
+        assert!(found.is_empty(), "followed too deep: {found:?}");
+
+        fs::remove_dir_all(&root).ok();
+    }
 
     #[test]
     fn reads_port_and_api_key_from_config_override() {
@@ -241,16 +337,62 @@ pub fn origin_from_db_path(path: &Path) -> Option<String> {
         .map(String::from)
 }
 
-/// Returns a list of all remote dbs
+/// How far below the sync root a peer's database may sit.
+///
+/// Two, because the two devices that share this folder do not nest it the same way. A desktop
+/// `setup_local_remote` writes `<root>/<device uuid>/test.db`, while an Android device copies its
+/// tree out through SAF as `<root>/<hostname>/<device uuid>/test.db` -- `SyncInterface.kt`
+/// documents that extra level, and it is what the phone actually puts in the folder. Scanning
+/// exactly one level, as this did, meant a PC sharing a folder with a phone saw *nothing*: it
+/// looked for `<root>/<hostname>/*.db` and found only another directory. The phone could read the
+/// PC, the PC could not read the phone, and sync looked like it was working from one end.
+///
+/// Bounded rather than a full walk: the folder is shared, so an unbounded recursion would follow
+/// whatever anyone else put in it, and every layout either device writes is covered by two.
+const MAX_REMOTE_DEPTH: usize = 2;
+
+/// Returns a list of all remote dbs, at either of the depths a peer may have written one.
+///
+/// A `.db` sitting loose at the very root is deliberately not a remote: the directory holding a
+/// database *is* the device that wrote it (see `origin_from_db_path`), and the root belongs to
+/// nobody. That was true of the single-level scan this replaces, and events that cannot be
+/// attributed are worse than events not read.
 fn find_remotes(sync_directory: &Path) -> std::io::Result<Vec<PathBuf>> {
-    let dbs = fs::read_dir(sync_directory)?
-        .map(|res| res.ok().unwrap().path())
-        .filter(|p| p.is_dir())
-        .flat_map(|d| fs::read_dir(d).unwrap())
-        .map(|res| res.ok().unwrap().path())
-        .filter(|path| path.extension().unwrap_or_else(|| OsStr::new("")) == "db")
-        .collect();
+    let mut dbs = Vec::new();
+    let entries = match fs::read_dir(sync_directory) {
+        Ok(entries) => entries,
+        Err(e) => return Err(e),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_remotes(&path, MAX_REMOTE_DEPTH - 1, &mut dbs);
+        }
+    }
+    dbs.sort();
     Ok(dbs)
+}
+
+/// Collect `*.db` files up to `depth` directories below `dir`.
+///
+/// Unreadable entries are skipped rather than panicking: this reads a folder other devices write
+/// into, so a half-written directory or one Syncthing has locked is an ordinary event, and it must
+/// not take down a sync that could still carry everything else.
+fn collect_remotes(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if depth > 0 {
+                collect_remotes(&path, depth - 1, out);
+            }
+        } else if path.extension().unwrap_or_else(|| OsStr::new("")) == "db" {
+            out.push(path);
+        }
+    }
 }
 
 /// Returns a list of all remotes, excluding local ones
