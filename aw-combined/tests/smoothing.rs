@@ -50,6 +50,7 @@ fn input(buckets: Vec<(&str, Vec<Event>)>) -> PipelineInput {
         idle: Vec::new(),
         min_contention: default_min_contention(),
         decisions: Vec::new(),
+        not_counted: Vec::new(),
     }
 }
 

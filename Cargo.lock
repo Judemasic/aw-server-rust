@@ -223,6 +223,7 @@ version = "0.1.0"
 dependencies = [
  "aw-models",
  "chrono",
+ "fancy-regex",
  "log",
  "serde",
  "serde_json",

@@ -39,6 +39,7 @@ fn base(activity: Vec<BucketEvents>) -> PipelineInput {
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: Vec::new(),
+        not_counted: Vec::new(),
     }
 }
 

@@ -55,6 +55,7 @@ fn day(phone: Vec<Event>, tablet: Vec<Event>, lines: &[String]) -> Vec<Segment> 
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: merge_decisions(&parse_records(&lines.join("\n"))),
+        not_counted: Vec::new(),
     };
     coalesce(compute_segments(input))
 }
@@ -339,6 +340,7 @@ fn a_peers_pick_never_matches_the_device_reading_it() {
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: merge_decisions(&parse_records(&record)),
+        not_counted: Vec::new(),
     };
     let segs = coalesce(compute_segments(input));
 

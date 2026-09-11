@@ -195,6 +195,7 @@ mod tests {
             idle,
             min_contention: crate::default_min_contention(),
             decisions: Vec::new(),
+            not_counted: Vec::new(),
         }
     }
 

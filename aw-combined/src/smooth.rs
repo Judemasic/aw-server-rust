@@ -295,6 +295,8 @@ mod tests {
             auto_resolved: false,
             label_override: None,
             ignored: false,
+            not_counted: false,
+            excluded_labels: Vec::new(),
             deliberate_background: Vec::new(),
             smoothed_seconds: 0,
             absorbed_labels: Vec::new(),

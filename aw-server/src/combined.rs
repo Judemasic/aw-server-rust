@@ -20,7 +20,7 @@ use serde_json::{json, Map, Value};
 use aw_combined::{
     activity_label, coalesce, compute_segments, default_min_contention, merge_decisions, parse_line,
     resolve_bucket_device, smooth, synced_from_hostname, BucketEvents, PipelineInput, Segment,
-    SharedRecord, SmoothOptions,
+    NotCountedRule, SharedRecord, SmoothOptions,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -146,7 +146,62 @@ fn probe(req: &TimelineRequest) -> PipelineInput {
         idle: Vec::new(),
         min_contention: default_min_contention(),
         decisions: Vec::new(),
+        not_counted: Vec::new(),
     }
+}
+
+/// Datastore key holding aw-webui's whole categorisation. One value, a JSON array of categories —
+/// the same setting the category editor posts and the same one settings sync carries between
+/// devices (roadmap 2.3).
+const CLASSES_KEY: &str = "settings.classes";
+
+/// The "never count this" rules, read off the owner's categories (roadmap 4.6).
+///
+/// A category opts in with `data.not_counted: true`. Reading them here rather than taking them as a
+/// request parameter is what makes every screen agree: the day view, the combined timeline and the
+/// day's own total all read one server answer, so none of them can be excluding a different set
+/// from the others — which is exactly how 4.4d's two-day bug happened.
+///
+/// **A broken rule is skipped, never fatal.** `classes` is edited by hand in Settings and can hold
+/// a regex that does not compile. Refusing to draw the day because one rule is malformed would take
+/// the whole screen away over a typo; the other rules still apply and the bad one is logged.
+///
+/// Children inherit nothing: a category's rule matches or it does not, and a child that should also
+/// be excluded says so itself. That mirrors how categorisation already works — a child is not
+/// matched by its parent's rule — so the owner has one model to hold, not two.
+fn not_counted_rules(ds: &Datastore) -> Vec<NotCountedRule> {
+    let Ok(raw) = ds.get_key_value(CLASSES_KEY) else {
+        return Vec::new(); // no categorisation stored yet
+    };
+    let Ok(Value::Array(classes)) = serde_json::from_str::<Value>(&raw) else {
+        log::warn!("{CLASSES_KEY} is not a JSON array; no exclusions applied");
+        return Vec::new();
+    };
+    let mut rules = Vec::new();
+    for class in &classes {
+        if class.pointer("/data/not_counted") != Some(&Value::Bool(true)) {
+            continue;
+        }
+        let Some(regex) = class.pointer("/rule/regex").and_then(Value::as_str) else {
+            continue; // a `type: none` rule matches nothing; nothing to exclude
+        };
+        let ignore_case = class.pointer("/rule/ignore_case") == Some(&Value::Bool(true));
+        let select_keys = class
+            .pointer("/rule/select_keys")
+            .and_then(Value::as_array)
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|keys: &Vec<String>| !keys.is_empty());
+        match NotCountedRule::new(regex, ignore_case, select_keys) {
+            Ok(rule) => rules.push(rule),
+            Err(e) => log::warn!("not-counted rule `{regex}` does not compile, skipping it: {e}"),
+        }
+    }
+    rules
 }
 
 /// Read one day (or any range) out of the datastore and return the combined track, the per-device
@@ -212,6 +267,8 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         // ④'s input. Merged here rather than stored merged, because the merge's answer changes
         // whenever a peer's file arrives, and a stored answer would go stale silently (R18).
         decisions: merge_decisions(&stored_records(ds)?),
+        // ②b. Read from the owner's categories, not from the request: see `not_counted_rules`.
+        not_counted: not_counted_rules(ds),
     };
 
     // Per-device tracks are built from the *raw* events, before idle subtraction and before
@@ -262,6 +319,10 @@ fn combined_row(seg: &Segment) -> Value {
         "resolved_by": seg.resolved_by,
         "auto_resolved": seg.auto_resolved,
         "ignored": seg.ignored,
+        // Roadmap 4.6: ignored because a rule says this never counts, rather than because the
+        // owner answered "I was away". The view says different things about the two.
+        "not_counted": seg.not_counted,
+        "excluded_labels": seg.excluded_labels,
         "relabelled": seg.label_override.is_some(),
         "deliberate_background": seg.deliberate_background,
         // Roadmap 4.5. What ⑦ rounded into this block, so the view can say so.

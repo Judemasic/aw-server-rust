@@ -63,6 +63,7 @@ fn overlap(lines: &[String], own: &str) -> Vec<Segment> {
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: merge_decisions(&records),
+        not_counted: Vec::new(),
     };
     coalesce(compute_segments(input))
 }
@@ -297,6 +298,7 @@ fn a_rule_does_not_touch_a_different_contention() {
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: merge_decisions(&records),
+        not_counted: Vec::new(),
     };
     let segs = coalesce(compute_segments(input));
     assert!(segs[0].resolved_by.is_none(), "Signal vs Kindle is a different question");
@@ -335,6 +337,7 @@ fn a_heartbeat_split_event_still_matches_the_decision_made_about_it() {
         idle: vec![],
         min_contention: default_min_contention(),
         decisions: merge_decisions(&records),
+        not_counted: Vec::new(),
     };
     let segs = coalesce(compute_segments(input));
     assert_eq!(segs[0].resolved_by.as_deref(), Some("d_1"));

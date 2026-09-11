@@ -30,12 +30,14 @@ mod apply;
 mod attribute;
 mod classify;
 mod coalesce;
+mod exclude;
 pub mod decision;
 mod normalise;
 mod segment;
 mod smooth;
 
 pub use coalesce::coalesce;
+pub use exclude::NotCountedRule;
 pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
 pub use normalise::{resolve_bucket_device, synced_from_hostname};
 pub use smooth::{smooth, SmoothOptions, DEFAULT_SLIVER_SECS, NOISE_FLOOR_SECS};
@@ -68,6 +70,10 @@ pub struct PipelineInput {
     pub idle: Vec<BucketEvents>,
     /// Minimum contention duration (roadmap D15/Q1). Use [`default_min_contention`].
     pub min_contention: Duration,
+    /// Activity the owner has said never counts (roadmap 4.6), compiled from the categories
+    /// flagged `data.not_counted`. Applied at ②b, before classification, so an excluded app is not
+    /// even a competitor. Empty is the behaviour every earlier phase had.
+    pub not_counted: Vec<NotCountedRule>,
     /// The owner's decisions, already merged across every device ([`merge_decisions`]). Step ④
     /// applies them; an empty vec is the Phase 3 behaviour, unchanged.
     ///
@@ -166,6 +172,16 @@ pub struct Segment {
     /// True when the owner said they were away (`outcome: ignore`): the segment draws, but its
     /// seconds count toward no total.
     pub ignored: bool,
+    /// True when it is a **rule** that stopped this block counting, not an answer to a question
+    /// (roadmap 4.6). Always accompanied by `ignored`; kept apart from it so the view can say
+    /// *"a rule excludes this"* and point at the rule, rather than *"you were away"*, which the
+    /// owner never said.
+    pub not_counted: bool,
+    /// The activity labels ②b took out of this segment, sorted and deduplicated. Non-empty either
+    /// when the block stopped counting entirely or when an excluded app was removed from a
+    /// competition it used to be part of — an excluded competitor that simply vanished would leave
+    /// the view unable to explain why a block it used to shade is now settled.
+    pub excluded_labels: Vec<String>,
     /// Apps the owner ticked as deliberately running alongside the winner. Kept for the day view
     /// (**R6** still means one foreground) and for the rules engine R15 builds on this data.
     pub deliberate_background: Vec<String>,
@@ -195,7 +211,8 @@ impl Segment {
     }
 }
 
-/// Run ① normalise, ② segment, ③ classify, ④ apply decisions, ⑤ provisional attribution. Deterministic: identical
+/// Run ① normalise, ② segment, ②b exclude, ③ classify, ④ apply decisions, ⑤ provisional
+/// attribution. Deterministic: identical
 /// input (in any event/bucket order) yields byte-identical output (R18).
 ///
 /// Step ⑥ ([`coalesce`]) is a separate opt-in call — the pipeline stays lossless by default so Phase 4 can attach decisions
@@ -203,6 +220,7 @@ impl Segment {
 pub fn compute_segments(input: PipelineInput) -> Vec<Segment> {
     let intervals = normalise::normalise(&input);
     let mut segments = segment::segment(&intervals);
+    exclude::exclude(&mut segments, &input.not_counted);
     classify::classify(&mut segments, input.min_contention);
     apply::apply(&mut segments, &input.decisions, &input.roles_by_uuid());
     attribute::attribute(&mut segments);
