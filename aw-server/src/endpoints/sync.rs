@@ -99,6 +99,6 @@ pub fn sync_configure(
 #[post("/run")]
 pub fn sync_now(state: &State<ServerState>) -> Json<SyncStatus> {
     let profile = crate::config::get_profile().to_string();
-    sync_setup::run_once(&state.datastore, &profile, true);
+    sync_setup::run_once(&state.datastore, &profile, &state.device_id, true);
     sync_status(state)
 }

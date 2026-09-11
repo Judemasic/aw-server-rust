@@ -229,6 +229,7 @@ async fn main() -> Result<(), rocket::Error> {
     aw_server::sync_setup::spawn_daemon(
         server_state.datastore.clone(),
         aw_server::config::get_profile().to_string(),
+        server_state.device_id.clone(),
     );
 
     let _rocket = endpoints::build_rocket(server_state, config)

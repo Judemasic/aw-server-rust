@@ -259,7 +259,7 @@ pub fn aw_sync_binary() -> Option<PathBuf> {
 /// Blocking on purpose. A pass over a day's events takes well under a second against a local
 /// server, and the page's button is a thing a person is *watching*: handing back a job id they
 /// then have to poll would be more machinery and less information.
-pub fn run_once(ds: &Datastore, profile: &str, manual: bool) -> LastRun {
+pub fn run_once(ds: &Datastore, profile: &str, own_device_id: &str, manual: bool) -> LastRun {
     let started = Utc::now();
     let finish = |ok: bool, message: String| {
         let run = LastRun {
@@ -305,7 +305,31 @@ pub fn run_once(ds: &Datastore, profile: &str, manual: bool) -> LastRun {
     match output {
         Ok(out) if out.status.success() => {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            finish(true, summarise(&stderr))
+            let mut message = summarise(&stderr);
+
+            // Events have moved; now the rules for reading them. Done in the same pass, and in
+            // this order, so the folder is left consistent -- a day's events and the categories
+            // that interpret them arriving a quarter of an hour apart is how two devices show
+            // the same day two ways.
+            //
+            // A failure here does not fail the pass: the events did move, and saying "sync
+            // failed" would be a worse lie than naming the part that did not.
+            let hostname = gethostname::gethostname().to_string_lossy().to_string();
+            match crate::shared_store::sync_shared_store(ds, &dir, own_device_id, &hostname) {
+                Ok(report) => {
+                    if let Some(extra) = report.summary() {
+                        message = format!("{message} Settings: {extra}.");
+                    }
+                    for problem in &report.problems {
+                        log::warn!("Shared store: {problem}");
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Shared store: {e}");
+                    message = format!("{message} Settings did not sync: {e}");
+                }
+            }
+            finish(true, message)
         }
         Ok(out) => {
             // aw-sync logs to stderr, so a failure's reason is there rather than in stdout.
@@ -395,13 +419,13 @@ pub fn set_sync_enabled(ds: &Datastore, enabled: bool) -> Result<(), String> {
 /// most likely to fail and the least likely to be noticed. The page's button is there for anyone
 /// who does not want to wait.
 #[cfg(not(target_os = "android"))]
-pub fn spawn_daemon(ds: Datastore, profile: String) {
+pub fn spawn_daemon(ds: Datastore, profile: String, own_device_id: String) {
     std::thread::spawn(move || loop {
         std::thread::sleep(SYNC_INTERVAL);
         if !sync_enabled(&ds) {
             continue;
         }
-        let run = run_once(&ds, &profile, false);
+        let run = run_once(&ds, &profile, &own_device_id, false);
         if run.ok {
             log::info!("Scheduled sync: {}", run.message);
         } else {

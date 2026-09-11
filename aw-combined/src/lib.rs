@@ -34,11 +34,16 @@ pub mod decision;
 mod exclude;
 mod normalise;
 mod segment;
+pub mod settings;
 mod smooth;
 
 pub use coalesce::coalesce;
 pub use decision::{merge_decisions, parse_line, parse_records, Decision, SharedRecord};
 pub use exclude::NotCountedRule;
+pub use settings::{
+    effective_settings, is_shared_setting_key, parse_settings, plan_settings_sync,
+    setting_to_json_line, Setting, SettingsPlan,
+};
 pub use normalise::{resolve_bucket_device, synced_from_hostname};
 pub use smooth::{smooth, SmoothOptions, DEFAULT_SLIVER_SECS, NOISE_FLOOR_SECS};
 
