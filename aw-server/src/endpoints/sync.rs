@@ -40,6 +40,9 @@ pub struct SyncStatus {
     /// built on its own genuinely cannot sync -- and one the page must say plainly rather than
     /// discover when the button fails.
     can_sync: bool,
+    /// Whether a pass is in flight right now. The page polls this rather than waiting on the
+    /// request that started it -- see `sync_setup::start_run` for why waiting deadlocks.
+    running: bool,
 }
 
 #[get("/")]
@@ -54,6 +57,7 @@ pub fn sync_status(state: &State<ServerState>) -> Json<SyncStatus> {
         peers: sync_setup::peers(&dir, &state.device_id),
         last_run: sync_setup::last_run(),
         can_sync: sync_setup::aw_sync_binary().is_some(),
+        running: sync_setup::is_running(),
     })
 }
 
@@ -86,19 +90,26 @@ pub fn sync_configure(
     Ok(sync_status(state))
 }
 
-/// Run one pass now, and answer with the whole status.
+/// Start a pass, and answer at once with the status showing `running: true`.
 ///
-/// Answering with the status rather than just the result is what lets the page show the new peer
-/// list in the same breath as "synced 190 events": the first sync is exactly the moment the folder
-/// changes, and a page that had to ask again would show a stale list for as long as that took.
+/// **It does not wait for the pass**, and the first version's attempt to is worth recording: it
+/// deadlocked. `aw-sync` is a separate process that talks to this server over HTTP, so a handler
+/// blocking until it finishes is a handler waiting on a request that cannot be served until it
+/// returns. The page timed out after thirty seconds and the log held aw-sync's own
+/// `GET /api/0/info` timing out against us -- the server had, in effect, asked itself a question
+/// while refusing to answer.
 ///
-/// **Not an error response when the sync fails.** A failed pass is a normal outcome the page
-/// renders -- the folder is not shared yet, Syncthing has not finished, a peer wrote a file we
-/// cannot read -- and an HTTP error would push it into an error handler that says less than the
-/// message does.
+/// The page polls `GET /api/0/sync` until `running` goes false and then reads `last_run`. A failed
+/// pass is still not an error response: it is a normal outcome the page renders, and an HTTP error
+/// would push it into a handler that says less than the message does.
 #[post("/run")]
 pub fn sync_now(state: &State<ServerState>) -> Json<SyncStatus> {
     let profile = crate::config::get_profile().to_string();
-    sync_setup::run_once(&state.datastore, &profile, &state.device_id, true);
+    sync_setup::start_run(
+        state.datastore.clone(),
+        profile,
+        state.device_id.clone(),
+        true,
+    );
     sync_status(state)
 }

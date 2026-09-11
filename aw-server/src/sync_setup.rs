@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, SystemTime};
 
@@ -225,6 +226,52 @@ static LAST_RUN: Mutex<Option<LastRun>> = Mutex::new(None);
 /// button while the timer fires would otherwise have two processes writing the same database.
 static RUNNING: Mutex<()> = Mutex::new(());
 
+/// Whether a pass is in flight, readable without taking the lock.
+///
+/// The page needs to say "syncing…" and then stop saying it, which means asking a question that
+/// must never block -- if answering "are you busy?" could wait on the thing it is asking about,
+/// the page would hang exactly when it most needs to be responsive.
+static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+pub fn is_running() -> bool {
+    IN_FLIGHT.load(Ordering::SeqCst)
+}
+
+/// Start a pass on a thread of its own and return at once.
+///
+/// **This must not be done on the request thread, and that is not a performance opinion.** The
+/// first version ran the pass inline in `POST /api/0/sync/run`, and it deadlocked: `aw-sync` is a
+/// separate process that talks to this server over HTTP, so a handler that blocks while waiting
+/// for it is a handler waiting for a request that cannot be served until it returns. What the
+/// owner saw was the page giving up after thirty seconds; what the log recorded was aw-sync's own
+/// `GET /api/0/info` timing out against us.
+///
+/// So the button starts the work and the page watches [`is_running`]. Returns false if a pass was
+/// already in flight, which is not a failure -- the thing the caller asked for is happening.
+pub fn start_run(ds: Datastore, profile: String, own_device_id: String, manual: bool) -> bool {
+    if IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return false;
+    }
+    std::thread::spawn(move || {
+        // `IN_FLIGHT` is cleared however this ends, panic included: a flag left set would make the
+        // page spin forever and the button refuse to start another pass.
+        struct Clear;
+        impl Drop for Clear {
+            fn drop(&mut self) {
+                IN_FLIGHT.store(false, Ordering::SeqCst);
+            }
+        }
+        let _clear = Clear;
+        let run = run_once(&ds, &profile, &own_device_id, manual);
+        if run.ok {
+            log::info!("Sync: {}", run.message);
+        } else {
+            log::warn!("Sync failed: {}", run.message);
+        }
+    });
+    true
+}
+
 pub fn last_run() -> Option<LastRun> {
     LAST_RUN.lock().ok().and_then(|g| g.clone())
 }
@@ -425,12 +472,8 @@ pub fn spawn_daemon(ds: Datastore, profile: String, own_device_id: String) {
         if !sync_enabled(&ds) {
             continue;
         }
-        let run = run_once(&ds, &profile, &own_device_id, false);
-        if run.ok {
-            log::info!("Scheduled sync: {}", run.message);
-        } else {
-            log::warn!("Scheduled sync failed: {}", run.message);
-        }
+        // Through `start_run` like the button, so the two cannot overlap.
+        start_run(ds.clone(), profile.clone(), own_device_id.clone(), false);
     });
 }
 
