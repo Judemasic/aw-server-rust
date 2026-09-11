@@ -24,9 +24,11 @@
 //! 3. **Went-and-came-back.** `A, B, A` with `B` under the threshold: `B` joins `A`. The strongest
 //!    rule of the set — the bracket *is* the evidence that the stretch was really one stretch.
 //! 3b. **The detour may be several apps long** (roadmap 4.5c, the owner's own example:
-//!    `YouTube, Photos, Gallery, YouTube`). The bracket is looked for *outward past a whole run* of
-//!    sub-threshold blocks, and the run is then peeled from its ends so every piece of it lands in
-//!    one of the two anchors rather than in another sliver. See [`bracketed`].
+//!    `YouTube, Photos, Gallery, YouTube`). The bracket is any activity appearing on *both* sides of
+//!    the sliver with nothing but slivers in between — see [`bracket_idents`] for why it is phrased
+//!    that way rather than as "the nearest real block on each side", which measured non-monotone.
+//!    Under this rule a sliver may only join a neighbour carrying the bracket's own activity, so a
+//!    run fills from its ends inward instead of collapsing into a block the day never had.
 //! 5. **`A, B, C` with `B` short and no bracket stays literal.** Genuinely ambiguous; guessing is
 //!    worse than leaving it.
 //! 6. **A decided stretch never shatters.** Segments sharing one `resolved_by` join each other at
@@ -127,8 +129,20 @@ fn label_of(seg: &Segment) -> String {
 /// Rules 1 and 1b. `resolved_by` must be *equal*, which covers both directions of rule 1 at once:
 /// two `None`s join freely, two halves of one decision join under rule 6, and an answered stretch
 /// and an unanswered one never touch.
+///
+/// **`ignored` and `not_counted` must match as well, and that is not belt-and-braces.** A block a
+/// *rule* emptied (roadmap 4.6a) carries `ignored` with **no** `resolved_by` at all — the owner
+/// answered no question about it — so `resolved_by` equality alone reads it as freely joinable with
+/// any ordinary settled block beside it. Found by measuring: with the owner's `One UI Home` rule
+/// live, 2026-09-10 moved **28 seconds** out of the not-counted total and into the day's, because a
+/// counted sliver was absorbed into an excluded block and vice versa. Smoothing is a drawing
+/// transform and may never move a second across the line between counting and not counting.
 fn joinable(a: &Segment, b: &Segment) -> bool {
-    !a.unresolved && !b.unresolved && a.resolved_by == b.resolved_by
+    !a.unresolved
+        && !b.unresolved
+        && a.resolved_by == b.resolved_by
+        && a.ignored == b.ignored
+        && a.not_counted == b.not_counted
 }
 
 /// Index of the neighbour before `i`, if it is contiguous and joinable.
@@ -166,96 +180,117 @@ fn longer(segs: &[Segment], prev: Option<usize>, next: Option<usize>) -> Option<
 ///
 /// This is the whole of the rule set. **Where** it goes is a separate question, answered by
 /// [`longer`] and never by which rule said yes — see the note there.
-fn absorbable(segs: &[Segment], i: usize, opts: &SmoothOptions) -> bool {
-    let seg = &segs[i];
-
-    // Rule 6 — inside one decision's window, at any size. `joinable` has already established that
-    // a neighbour reached here carries the *same* decision id, so this can never merge two answers.
-    if !opts.sliver.is_zero() && seg.resolved_by.is_some() {
-        return true;
-    }
-
-    let dur = span(seg);
-
-    // Rule 2 — the noise floor. No bracket needed: this is not a preference, it is jitter.
-    if dur < opts.noise_floor {
-        return true;
-    }
-
-    // Rule 3 — went and came back. Rule 5 is the `else`: short, unbracketed, and left literal.
-    if opts.sliver.is_zero() || dur >= opts.sliver || !bracketed(segs, i, opts) {
-        return false;
-    }
-    // Rule 3b — peel the run from its ends, never from the middle. A sliver with a real block on
-    // one side goes into it now; one with slivers on both sides waits for an end to reach it. See
-    // [`bracketed`] for why waiting is what makes the run land in one place.
-    [prev_of(segs, i), next_of(segs, i)]
-        .into_iter()
-        .flatten()
-        .any(|j| span(&segs[j]) >= opts.sliver)
+/// The activity of one block, as the bracket test compares it: device plus label.
+fn ident(seg: &Segment) -> (String, String) {
+    (seg.foreground_slice().device.clone(), label_of(seg))
 }
 
-/// The nearest real block on each side, looking **outward past a whole run of slivers**, and whether
-/// those two are the same activity on the same device.
+/// Every activity that flanks this sliver on **both** sides with nothing but slivers in between.
 ///
 /// This is rule 3 as the owner asked for it on 2026-09-11: *"the smoothing should take youtube,
 /// photos, gallery, then youtube — if photos and gallery are less than the smoothing then take
-/// them"*. The rule used to look only at the two immediate neighbours, so `YouTube, Photos, Gallery,
-/// YouTube` smoothed to nothing at all: neither `Photos` nor `Gallery` was bracketed by a matching
-/// pair, and both fell through to rule 5 and stayed literal. The bracket is the evidence that the
-/// stretch was really one stretch, and it is no weaker for the detour having touched two apps
-/// instead of one.
+/// them"*. The rule used to compare only the two immediate neighbours, so `YouTube, Photos, Gallery,
+/// YouTube` smoothed to nothing at all: neither sliver was bracketed by a matching pair, and both
+/// fell through to rule 5 and stayed literal. The bracket is the evidence that the stretch was really
+/// one stretch, and it is no weaker for the detour having touched two apps instead of one.
 ///
-/// Each hop uses [`prev_of`]/[`next_of`], so a real gap or an answered block ends the walk — the run
-/// may not be crossed over a hole or over somebody's decision. The walk terminates because it moves
-/// one index per step.
+/// # Why "any flanking pair" and not "the nearest real block on each side"
 ///
-/// **Why the run is then peeled from its ends** (rule 3b, in [`absorbable`]) rather than collapsed
-/// in any order: a sliver in the middle of a run has slivers on both sides, and letting it join one
-/// of *those* would build a block that is neither anchor's app and may now be over the threshold —
-/// `A, b1, b2, b3, A` could end up as `A, b1+b2 (24s), A`, which is a block the day never had.
-/// Peeling from the ends means every sliver in the run lands in an anchor, and since both anchors
-/// carry the same label by the test below, which one it lands in says the same thing about the day.
-fn bracketed(segs: &[Segment], i: usize, opts: &SmoothOptions) -> bool {
-    let anchor = |back: bool| -> Option<usize> {
+/// The obvious reading of *"look past the run"* is to walk outward to the first block that is **not**
+/// a sliver and compare those two anchors. That was built first, and it is **not monotone in the
+/// threshold** — measured on the owner's real day, 2026-09-10 came back as 282 blocks at 15s and
+/// **290 at 60s**. Raising the number made the day more shattered, which is the one property this
+/// module is not allowed to lose (see rule 7).
+///
+/// The reason is that "which block is an anchor" itself depends on the threshold. At 15s,
+/// `A(20s), b(10s), A(20s)` has two `A` anchors and `b` is absorbed. At 60s both `A`s are *themselves*
+/// slivers, so the walk goes straight past them looking for something bigger, finds two different
+/// apps out there, and the bracket that existed at 15s is gone.
+///
+/// Collecting **every** position reachable across slivers, and asking whether any activity appears on
+/// both sides, fixes that by construction: raising the threshold only ever *adds* reachable
+/// positions, so a bracket that held at a lower threshold still holds. Each hop uses
+/// [`prev_of`]/[`next_of`], so a real gap or somebody's decision still ends the walk — a run may not
+/// be crossed over a hole or over an answer.
+fn bracket_idents(segs: &[Segment], i: usize, opts: &SmoothOptions) -> Vec<(String, String)> {
+    // Walk one way, taking every block reached and stopping *after* the first non-sliver: it can be
+    // one end of a bracket, but nothing beyond it is reachable across slivers.
+    let side = |back: bool| -> Vec<(String, String)> {
+        let mut out = Vec::new();
         let mut at = i;
         loop {
-            let step = if back {
-                prev_of(segs, at)?
+            let Some(step) = (if back {
+                prev_of(segs, at)
             } else {
-                next_of(segs, at)?
+                next_of(segs, at)
+            }) else {
+                return out;
             };
+            out.push(ident(&segs[step]));
             if span(&segs[step]) >= opts.sliver {
-                return Some(step);
+                return out;
             }
             at = step;
         }
     };
-    match (anchor(true), anchor(false)) {
-        (Some(p), Some(n)) => {
-            let (a, b) = (&segs[p], &segs[n]);
-            a.foreground_slice().device == b.foreground_slice().device && label_of(a) == label_of(b)
-        }
-        _ => false,
-    }
+    let (before, after) = (side(true), side(false));
+    before.into_iter().filter(|b| after.contains(b)).collect()
 }
 
-/// Where segment `i` should go, if anywhere.
+/// Where segment `i` should go, if anywhere — `None` meaning it stays a block of its own.
 ///
-/// **The target never depends on which rule admitted the segment**, and that is not a detail. It
-/// was, once: rule 3 returned `prev` because `A, B, A` reads as "B belongs to the A before it".
-/// Measured on the owner's real day, that made the whole transform non-monotone — raising the
-/// threshold from 0 to 5s produced *more* blocks, because a crumb that had been joining its longer
-/// neighbour started joining its shorter one, and the merge that used to follow downstream no
-/// longer did. A threshold that can make the day more shattered by being raised is not a setting
-/// anyone can reason about. Both neighbours carry the same label whenever rule 3 fires, so joining
-/// the longer one says exactly the same thing about the day and keeps the guarantee: raising the
-/// number can only ever absorb more.
+/// **For rules 2 and 6 the target is simply the longer neighbour**, and that the target does not
+/// depend on which rule admitted the segment is not a detail. It did once: rule 3 returned `prev`
+/// because `A, B, A` reads as "B belongs to the A before it". Measured on the owner's real day, that
+/// made the whole transform non-monotone — raising the threshold from 0 to 5s produced *more*
+/// blocks, because a crumb that had been joining its longer neighbour started joining its shorter
+/// one, and the merge that used to follow downstream no longer did.
+///
+/// **Rule 3 is the exception, and has to be.** Once the bracket may be a whole run away
+/// ([`bracket_idents`]), a sliver in the middle of a run has slivers on both sides, and the longer of
+/// *those* is the wrong place: `A, b1(14s), b2(10s), b3(14s), A` would put `b2` into `b1`, and
+/// `b1+b2` at 24s is then over the threshold and stuck — leaving `A, b1(24s), A`, a block of an app
+/// the day never had for that long. So under rule 3 a sliver may only join a neighbour that **carries
+/// the bracket's own activity**, and otherwise waits: the run fills from its ends inward, every piece
+/// of it lands in the bracketing app, and since both ends carry that same activity, which end it
+/// lands in says the same thing about the day.
 fn target_for(segs: &[Segment], i: usize, opts: &SmoothOptions) -> Option<usize> {
-    if !absorbable(segs, i, opts) {
+    let seg = &segs[i];
+    let prev = prev_of(segs, i);
+    let next = next_of(segs, i);
+
+    // Rule 6 — inside one decision's window, at any size. `joinable` has already established that
+    // a neighbour reached here carries the *same* decision id, so this can never merge two answers.
+    if !opts.sliver.is_zero() && seg.resolved_by.is_some() {
+        return longer(segs, prev, next);
+    }
+
+    // Rule 2 — the noise floor. No bracket needed: this is not a preference, it is jitter.
+    let dur = span(seg);
+    if dur < opts.noise_floor {
+        return longer(segs, prev, next);
+    }
+
+    // Rule 8, and rule 5 as the fall-through: short, unbracketed, and left exactly as it is.
+    if opts.sliver.is_zero() || dur >= opts.sliver {
         return None;
     }
-    longer(segs, prev_of(segs, i), next_of(segs, i))
+
+    // Rule 3, and rule 3b in the `filter`.
+    let bracket = bracket_idents(segs, i, opts);
+    if bracket.is_empty() {
+        return None;
+    }
+    let eligible: Vec<usize> = [prev, next]
+        .into_iter()
+        .flatten()
+        .filter(|&j| bracket.contains(&ident(&segs[j])))
+        .collect();
+    // The longest of them, first one on a tie, which is `prev` — the same preference [`longer`] has,
+    // for the same reason: the choice must not depend on which end the list is read from (**R18**).
+    eligible
+        .into_iter()
+        .max_by_key(|&j| (span(&segs[j]).num_milliseconds(), std::cmp::Reverse(j)))
 }
 
 /// The single best absorption to do next, by rule 7's total order: shortest first, then label, then

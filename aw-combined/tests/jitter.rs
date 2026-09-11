@@ -20,8 +20,8 @@
 use std::collections::HashMap;
 
 use aw_combined::{
-    coalesce, compute_segments, default_min_contention, smooth, BucketEvents, PipelineInput,
-    Segment, SmoothOptions, EVENT_ORIGIN_KEY,
+    coalesce, compute_segments, default_min_contention, smooth, BucketEvents, NotCountedRule,
+    PipelineInput, Segment, SmoothOptions, EVENT_ORIGIN_KEY,
 };
 use aw_models::Event;
 use chrono::{DateTime, Duration, TimeZone, Utc};
@@ -51,6 +51,10 @@ fn event(a_ms: i64, b_ms: i64, app: &str) -> Event {
 }
 
 fn input(events: Vec<Event>) -> PipelineInput {
+    input_excluding(events, Vec::new())
+}
+
+fn input_excluding(events: Vec<Event>, not_counted: Vec<NotCountedRule>) -> PipelineInput {
     PipelineInput {
         own_device: "phone".to_string(),
         hostname_to_uuid: HashMap::new(),
@@ -61,7 +65,7 @@ fn input(events: Vec<Event>) -> PipelineInput {
         idle: Vec::new(),
         min_contention: default_min_contention(),
         decisions: Vec::new(),
-        not_counted: Vec::new(),
+        not_counted,
     }
 }
 
@@ -267,6 +271,38 @@ fn the_threshold_does_something_at_last() {
     );
 }
 
+/// The monotonicity guarantee, on a day whose *anchors* are short too -- which is the case the
+/// first version of the run-bracket failed, and which a real phone day is full of.
+#[test]
+fn raising_the_threshold_never_adds_blocks_when_every_block_is_short() {
+    let events = vec![
+        event(0, 18_000, "YouTube"),
+        event(18_008, 22_000, "One UI Home"),
+        event(22_033, 40_000, "YouTube"),
+        event(40_534, 43_000, "Photos"),
+        event(44_008, 47_000, "Photos"),
+        event(47_013, 61_000, "Reddit"),
+        event(61_010, 64_000, "One UI Home"),
+        event(64_020, 79_000, "Reddit"),
+    ];
+    let recorded: i64 = events.iter().map(|e| e.duration.num_milliseconds()).sum();
+    let mut last = usize::MAX;
+    for secs in [0, 5, 10, 15, 20, 30, 45, 60, 120, 300, 3600] {
+        let segs = day(events.clone(), secs);
+        assert!(
+            segs.len() <= last,
+            "{secs}s produced {} blocks, more than a smaller threshold's {last}",
+            segs.len()
+        );
+        assert_eq!(
+            counted_ms(&segs),
+            recorded,
+            "{secs}s changed what the day counts"
+        );
+        last = segs.len();
+    }
+}
+
 #[test]
 fn raising_the_threshold_never_adds_blocks_on_a_jittery_day() {
     let events = vec![
@@ -292,4 +328,128 @@ fn raising_the_threshold_never_adds_blocks_on_a_jittery_day() {
         );
         last = segs.len();
     }
+}
+
+/// The regression that sent 4.5c back for a second pass: measured on the owner's real day, the first
+/// version of the run-bracket returned **282 blocks at 15s and 290 at 60s**.
+#[test]
+fn a_bracket_does_not_disappear_when_the_threshold_rises() {
+    // Both anchors are only 20s long. Walking outward for the first block that is *not* a sliver
+    // finds them at 15s and walks straight past them at 60s, losing the bracket that was there.
+    let events = vec![
+        event(0, 20_000, "Photos"),
+        event(20_000, 30_000, "One UI Home"),
+        event(30_000, 50_000, "Photos"),
+    ];
+    assert_eq!(labels(&day(events.clone(), 15)), vec!["Photos"]);
+    assert_eq!(
+        labels(&day(events.clone(), 60)),
+        vec!["Photos"],
+        "raising the threshold un-absorbed a sliver it had already absorbed"
+    );
+}
+
+#[test]
+fn a_run_in_a_day_of_short_blocks_still_collapses() {
+    // Same shape as the run test above, but with anchors under every threshold tried -- which is
+    // what a real phone day looks like and what the first version of the rule could not handle.
+    let events = vec![
+        event(0, 20_000, "YouTube"),
+        event(20_000, 30_000, "A"),
+        event(30_000, 42_000, "B"),
+        event(42_000, 62_000, "YouTube"),
+    ];
+    for secs in [15, 30, 60, 300] {
+        let segs = day(events.clone(), secs);
+        assert_eq!(labels(&segs), vec!["YouTube"], "at {secs}s");
+    }
+}
+
+#[test]
+fn a_sliver_never_joins_a_neighbour_that_is_not_the_bracket() {
+    // `A, b1(14s), b2(10s), b3(14s), A`: shortest-first would put b2 into b1, and b1+b2 at 24s is
+    // then over the threshold and stuck -- leaving a 24s block of an app the day never had that
+    // long. Rule 3b is what stops it, and this is the shape that proves it.
+    let events = vec![
+        event(0, 300_000, "YouTube"),
+        event(300_000, 314_000, "A"),
+        event(314_000, 324_000, "B"),
+        event(324_000, 338_000, "C"),
+        event(338_000, 600_000, "YouTube"),
+    ];
+    let segs = day(events, 15);
+    assert_eq!(labels(&segs), vec!["YouTube"]);
+    assert_eq!(
+        segs[0].absorbed_labels,
+        vec!["A".to_string(), "B".to_string(), "C".to_string()]
+    );
+}
+
+#[test]
+fn an_unbracketed_run_between_short_blocks_is_still_left_alone() {
+    // Monotonicity must not be bought by absorbing things rule 5 protects. Nothing here appears on
+    // both sides of anything, so the day stays literal at every threshold.
+    let events = vec![
+        event(0, 20_000, "YouTube"),
+        event(20_000, 28_000, "A"),
+        event(28_000, 36_000, "B"),
+        event(36_000, 56_000, "Reddit"),
+    ];
+    for secs in [15, 60, 300] {
+        assert_eq!(
+            labels(&day(events.clone(), secs)),
+            vec!["YouTube", "A", "B", "Reddit"],
+            "at {secs}s"
+        );
+    }
+}
+
+/// Found by measuring the owner's real day against their own `One UI Home` rule: 28 seconds moved
+/// out of the not-counted total and into the day's.
+#[test]
+fn smoothing_never_moves_a_second_across_the_not_counted_line() {
+    // A block a *rule* emptied carries `ignored` with no `resolved_by`, so comparing decision ids
+    // alone read it as freely joinable with the ordinary block beside it.
+    let events = vec![
+        event(0, 60_000, "Photos"),
+        event(60_014, 68_000, "One UI Home"),
+        event(68_033, 130_000, "Photos"),
+        event(130_040, 134_000, "Reddit"),
+        event(134_020, 200_000, "One UI Home"),
+    ];
+    let rule = NotCountedRule::new("One UI Home", false, None).expect("a literal regex compiles");
+    let segs = smooth(
+        coalesce(compute_segments(input_excluding(
+            events.clone(),
+            vec![rule],
+        ))),
+        SmoothOptions::from_sliver_secs(60),
+    );
+
+    let recorded: i64 = events.iter().map(|e| e.duration.num_milliseconds()).sum();
+    let counted: i64 = segs
+        .iter()
+        .filter(|s| !s.ignored)
+        .map(|s| s.counted_span().num_milliseconds())
+        .sum();
+    let excluded: i64 = segs
+        .iter()
+        .filter(|s| s.ignored)
+        .map(|s| s.counted_span().num_milliseconds())
+        .sum();
+
+    // Every excluded event and nothing else -- summed from the events rather than written out, so
+    // the assertion cannot drift from the fixture.
+    let launcher: i64 = events
+        .iter()
+        .filter(|e| e.data["app"] == serde_json::json!("One UI Home"))
+        .map(|e| e.duration.num_milliseconds())
+        .sum();
+    assert_eq!(excluded, launcher);
+    assert_eq!(counted + excluded, recorded, "the day still adds up");
+    assert!(
+        segs.iter()
+            .all(|s| s.absorbed_labels.iter().all(|l| l != "One UI Home")),
+        "an excluded block was absorbed into one that counts"
+    );
 }
