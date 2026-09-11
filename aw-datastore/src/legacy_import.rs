@@ -35,12 +35,49 @@ mod import {
 
     use super::LegacyDatastoreImportError;
 
-    fn dbfile_path() -> PathBuf {
-        dirs::data_dir()
-            .expect("Unable to read user data dir")
-            .join("activitywatch")
-            .join("aw-server")
-            .join("peewee-sqlite.v2.db")
+    /// Every place a Python aw-server may have left its database, most likely first.
+    ///
+    /// There is more than one because the two servers do not agree about where "the user data
+    /// directory" is on Windows. `dirs::data_dir()` resolves to **Roaming** `%APPDATA%`, while
+    /// the Python server asks `appdirs.user_data_dir("activitywatch", "activitywatch")`, which
+    /// resolves to **Local** `%LOCALAPPDATA%` *and* doubles the folder name because appdirs puts
+    /// the author below the app. So the Roaming path this used to be the only candidate for
+    /// never exists on Windows, the import always reported "Did not find an old database", and
+    /// every Windows user moving to the Rust server silently started from an empty datastore.
+    ///
+    /// On Linux and macOS `data_dir()` is already right and stays first, so nothing changes
+    /// there.
+    fn dbfile_paths() -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+
+        if let Some(dir) = dirs::data_dir() {
+            paths.push(dir.join("activitywatch").join("aw-server"));
+        }
+
+        // Windows only: `data_local_dir()` is the same as `data_dir()` elsewhere, so adding
+        // these unconditionally would only mean checking the same path twice.
+        if cfg!(target_os = "windows") {
+            if let Some(dir) = dirs::data_local_dir() {
+                // What appdirs actually produces, and where a real v0.13 install was found.
+                paths.push(
+                    dir.join("activitywatch")
+                        .join("activitywatch")
+                        .join("aw-server"),
+                );
+                // Belt and braces for installs written without the author component.
+                paths.push(dir.join("activitywatch").join("aw-server"));
+            }
+        }
+
+        paths
+            .into_iter()
+            .map(|dir| dir.join("peewee-sqlite.v2.db"))
+            .collect()
+    }
+
+    /// The first candidate that is actually on disk, if any.
+    fn dbfile_path() -> Option<PathBuf> {
+        dbfile_paths().into_iter().find(|path| path.exists())
     }
 
     fn get_legacy_buckets(conn: &Connection) -> Result<Vec<Bucket>, LegacyDatastoreImportError> {
@@ -156,12 +193,14 @@ mod import {
         new_ds: &mut DatastoreInstance,
         new_conn: &Connection,
     ) -> Result<(), LegacyDatastoreImportError> {
-        let legacy_db_path = dbfile_path();
-        if !legacy_db_path.exists() {
-            info!("Did not find an old database, skipping legacy import");
-            return Ok(());
-        }
-        info!("Importing legacy DB");
+        let legacy_db_path = match dbfile_path() {
+            Some(path) => path,
+            None => {
+                info!("Did not find an old database, skipping legacy import");
+                return Ok(());
+            }
+        };
+        info!("Importing legacy DB from {}", legacy_db_path.display());
         let legacy_conn =
             Connection::open(legacy_db_path).expect("Unable to open corrupt legacy db file");
 
@@ -188,13 +227,42 @@ mod import {
         Ok(())
     }
 
+    /// The Windows path fix, asserted rather than described: the list has to contain the
+    /// Local-appdata path with the doubled folder name, because that is where a real Python
+    /// install writes and where the old single candidate was never looking.
+    #[test]
+    fn legacy_candidates_cover_the_python_server() {
+        let paths = dbfile_paths();
+        assert!(!paths.is_empty(), "no candidate paths at all");
+        assert!(
+            paths
+                .iter()
+                .all(|p| p.ends_with("aw-server/peewee-sqlite.v2.db")
+                    || p.ends_with("aw-server\\peewee-sqlite.v2.db")),
+            "a candidate does not name the legacy database: {paths:?}"
+        );
+
+        if cfg!(target_os = "windows") {
+            let local = dirs::data_local_dir().expect("no local data dir on windows");
+            let expected = local
+                .join("activitywatch")
+                .join("activitywatch")
+                .join("aw-server")
+                .join("peewee-sqlite.v2.db");
+            assert!(
+                paths.contains(&expected),
+                "the path the Python server actually writes is missing: {expected:?} not in {paths:?}"
+            );
+        }
+    }
+
     /* This test is disabled because it requires manual set-up of a old aw-server database
      * Can be run with:
      * cargo test --features legacy_import,legacy_import_tests */
     #[test]
     #[cfg_attr(not(feature = "legacy_import_tests"), ignore)]
     fn test_legacy_import() {
-        assert!(dbfile_path().exists());
+        assert!(dbfile_path().is_some());
         let mut new_conn =
             Connection::open_in_memory().expect("Unable to open corrupt legacy db file");
         let mut ds = DatastoreInstance::new(&mut new_conn, true).unwrap();
