@@ -25,6 +25,9 @@ pub mod device_id;
 pub mod dirs;
 pub mod endpoints;
 pub mod logging;
+/// Desktop sync setup, for the page that configures it. Not on Android, where the app owns sync.
+#[cfg(not(target_os = "android"))]
+pub mod sync_setup;
 pub mod version;
 
 #[cfg(target_os = "android")]

@@ -58,6 +58,8 @@ mod extension_cors;
 mod hostcheck;
 mod import;
 mod query;
+#[cfg(not(target_os = "android"))]
+mod sync;
 mod settings;
 
 #[cfg(target_os = "android")]
@@ -214,6 +216,16 @@ pub fn build_rocket(server_state: ServerState, config: AWConfig) -> rocket::Rock
             ],
         )
         .mount("/", rocket_cors::catch_all_options_routes());
+
+    // Desktop sync setup. Android mounts nothing here: the app drives sync itself through SAF
+    // (`SyncInterface.kt`), and an endpoint that answered would be a second, disagreeing owner.
+    #[cfg(not(target_os = "android"))]
+    {
+        rocket = rocket.mount(
+            "/api/0/sync",
+            routes![sync::sync_status, sync::sync_configure, sync::sync_now],
+        );
+    }
 
     // for each custom static directory, mount it at the given name
     for (name, dir) in custom_static {

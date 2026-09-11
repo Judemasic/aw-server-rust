@@ -222,6 +222,15 @@ async fn main() -> Result<(), rocket::Error> {
         device_id,
     };
 
+    // The background sync pass. Started before the server rather than after, because
+    // `launch()` does not return until the server stops -- and it is a no-op until somebody
+    // turns sync on from the page, so starting it early costs nothing.
+    #[cfg(not(target_os = "android"))]
+    aw_server::sync_setup::spawn_daemon(
+        server_state.datastore.clone(),
+        aw_server::config::get_profile().to_string(),
+    );
+
     let _rocket = endpoints::build_rocket(server_state, config)
         .ignite()
         .await?;
