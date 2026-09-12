@@ -19,8 +19,8 @@ use serde_json::{json, Map, Value};
 
 use aw_combined::{
     activity_label, coalesce, compute_segments, default_min_contention, merge_decisions,
-    parse_line, resolve_bucket_device, smooth, synced_from_hostname, BucketEvents, NotCountedRule,
-    PipelineInput, Segment, SharedRecord, SmoothOptions,
+    parse_line, questions, resolve_bucket_device, smooth, synced_from_hostname, BucketEvents,
+    NotCountedRule, PipelineInput, Question, QuestionOptions, Segment, SharedRecord, SmoothOptions,
 };
 use aw_datastore::Datastore;
 use aw_models::Event;
@@ -359,13 +359,36 @@ pub fn combined_timeline(ds: &Datastore, req: &TimelineRequest) -> Result<Value,
         .fold(chrono::Duration::zero(), |acc, s| acc + s.uncounted_span())
         .num_seconds();
 
+    // ⑧ Roadmap 4.11 — what the owner is actually *asked*, which is not one thing per block. Runs
+    // over the smoothed list because that is the list the view draws and the indices refer to it.
+    let asked = questions(&segments, QuestionOptions::default());
+    // Reverse index, so the view can go from a block it is drawing to the question it belongs to
+    // without scanning every question for every block.
+    let mut question_of: HashMap<usize, usize> = HashMap::new();
+    for (qi, q) in asked.iter().enumerate() {
+        for &b in &q.blocks {
+            question_of.insert(b, qi);
+        }
+    }
+
     Ok(json!({
         "start": req.start,
         "end": req.end,
         "own_device": req.own_device,
         "combined_seconds": combined_seconds,
         "excluded_seconds": excluded_seconds,
-        "combined": segments.iter().map(combined_row).collect::<Vec<_>>(),
+        "combined": segments
+            .iter()
+            .enumerate()
+            .map(|(i, seg)| combined_row(seg, question_of.get(&i).copied()))
+            .collect::<Vec<_>>(),
+        // One entry per thing the owner is asked about, in the order it happened. The count the
+        // header shows is this list's length, *not* the number of shaded blocks -- those two were
+        // the same number until 4.11 and the difference is the whole step.
+        "questions": asked
+            .iter()
+            .map(|q| question_row(q, &segments))
+            .collect::<Vec<_>>(),
         "devices": devices,
         // What the owner was reading, editing and timing during the stretches that counted.
         // Keyed by bucket type, because the view already knows what a `web.tab.current` event
@@ -416,10 +439,46 @@ fn background_rows(seg: &Segment) -> Vec<Value> {
     out
 }
 
+/// One question, as the resolution sheet needs it (roadmap 4.11).
+///
+/// `seconds` is the *answerable* time — the sum of the contended blocks' counted spans — and is
+/// deliberately smaller than `end - start`, which also covers the settled slivers the run was drawn
+/// across. The two are both here because they answer different things: the span says what to shade,
+/// and the seconds say how much time an answer will move. Reporting the span as the time would
+/// promise the owner seconds a watcher never recorded (**R11**).
+///
+/// `competitors` is already longest-first with the offered winner leading; the view renders it in
+/// the order it arrives rather than sorting again, so two devices cannot disagree about the order
+/// they put the same day's answers in (**R18**).
+fn question_row(q: &Question, segments: &[Segment]) -> Value {
+    json!({
+        "start": q.start,
+        "end": q.end,
+        "seconds": q.unresolved_seconds(segments),
+        "blocks": q.blocks,
+        "competitors": q
+            .competitors
+            .iter()
+            .map(|c| json!({
+                "device": c.device,
+                "label": c.label,
+                // How long this activity actually ran, across the whole run and counting an
+                // overlap once — not the window's length, which used to be handed to every
+                // competitor alike and so told the owner nothing.
+                "seconds": c.seconds,
+                "is_foreground": c.is_foreground,
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
 /// One row of the combined track: what counted, and whether the view must shade it (**R8**).
-fn combined_row(seg: &Segment) -> Value {
+fn combined_row(seg: &Segment, question: Option<usize>) -> Value {
     let fg = seg.foreground_slice();
     json!({
+        // Index into the response's `questions`, or null for a block nobody is being asked about.
+        // Every block carrying one shades as part of one region and answers with one decision.
+        "question": question,
         "start": seg.start,
         "end": seg.end,
         // What a watcher actually recorded inside this block, which is not the same as its span:

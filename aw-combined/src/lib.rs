@@ -33,6 +33,7 @@ mod coalesce;
 pub mod decision;
 mod exclude;
 mod normalise;
+pub mod question;
 mod segment;
 pub mod settings;
 mod smooth;
@@ -45,6 +46,7 @@ pub use settings::{
     setting_to_json_line, Setting, SettingsPlan,
 };
 pub use normalise::{resolve_bucket_device, synced_from_hostname};
+pub use question::{questions, Competitor, Question, QuestionOptions, DEFAULT_QUESTION_GAP_SECS};
 pub use smooth::{smooth, SmoothOptions, DEFAULT_SLIVER_SECS, NOISE_FLOOR_SECS};
 
 pub use aw_models::EVENT_ORIGIN_KEY;
