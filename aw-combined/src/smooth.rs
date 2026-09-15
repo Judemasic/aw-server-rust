@@ -137,8 +137,15 @@ fn label_of(seg: &Segment) -> String {
 /// live, 2026-09-10 moved **28 seconds** out of the not-counted total and into the day's, because a
 /// counted sliver was absorbed into an excluded block and vice versa. Smoothing is a drawing
 /// transform and may never move a second across the line between counting and not counting.
+///
+/// **`category_by` must match too** (roadmap 4.14), for the same reason: a sliver absorbed across
+/// the edge of a stretch the owner put in another category would move its seconds into, or out of,
+/// that category -- and a block that joined a neighbour would lose the owner's category entirely.
 fn joinable(a: &Segment, b: &Segment) -> bool {
-    !a.unresolved && !b.unresolved && a.resolved_by == b.resolved_by
+    !a.unresolved
+        && !b.unresolved
+        && a.resolved_by == b.resolved_by
+        && a.category_by == b.category_by
 }
 
 /// Index of the neighbour before `i`, if it is contiguous and joinable.
@@ -438,6 +445,8 @@ mod tests {
             resolved_by: None,
             auto_resolved: false,
             label_override: None,
+            category_override: None,
+            category_by: None,
             ignored: false,
             not_counted: false,
             excluded_labels: Vec::new(),

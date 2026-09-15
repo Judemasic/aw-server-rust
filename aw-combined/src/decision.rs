@@ -32,6 +32,13 @@ pub const OUTCOME_FOREGROUND: &str = "foreground";
 pub const OUTCOME_RELABEL: &str = "relabel";
 /// `resolution.outcome`: the owner was away; this time counts as nothing.
 pub const OUTCOME_IGNORE: &str = "ignore";
+/// `resolution.outcome`: this stretch counts toward a category of the owner's choosing, whatever
+/// its app would otherwise be categorised as (roadmap 4.14). `resolution.category` names it.
+///
+/// Unlike the three outcomes above it is **not an answer to an overlap**: it says what kind of
+/// time this was, never whose. So it sits on top of whatever else settled the stretch rather than
+/// competing with it for the one decision a segment carries -- see `apply`.
+pub const OUTCOME_CATEGORY: &str = "category";
 
 /// Field separator inside a signature's match key. Both are ASCII control characters that cannot
 /// occur in an app name or a hostname, so no escaping is needed — same choice as `SharedStore.kt`.
@@ -101,6 +108,9 @@ pub struct Resolution {
     pub outcome: String,
     pub foreground: Option<ForegroundPick>,
     pub label: Option<String>,
+    /// The category path an `outcome: category` decision puts this time in, e.g. `["Study"]` or
+    /// `["Work", "Reading"]`. Empty for every other outcome, and for a line that names none.
+    pub category: Vec<String>,
     pub deliberate_background: Vec<String>,
 }
 
@@ -243,6 +253,7 @@ fn parse_resolution(json: Option<&Value>) -> Resolution {
                 outcome: String::new(),
                 foreground: None,
                 label: None,
+                category: Vec::new(),
                 deliberate_background: Vec::new(),
             }
         }
@@ -255,18 +266,23 @@ fn parse_resolution(json: Option<&Value>) -> Resolution {
             app: str_field(f, "app"),
         }),
         label: Some(str_field(json, "label")).filter(|l| !l.is_empty()),
-        deliberate_background: json
-            .get("deliberate_background")
-            .and_then(|b| b.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect()
-            })
-            .unwrap_or_default(),
+        category: str_array(json, "category"),
+        deliberate_background: str_array(json, "deliberate_background"),
     }
+}
+
+/// A list of non-empty strings; anything missing, null or of the wrong shape reads as empty.
+fn str_array(json: &Value, key: &str) -> Vec<String> {
+    json.get(key)
+        .and_then(|b| b.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 fn parse_tombstone(json: &Value) -> Option<Tombstone> {
@@ -289,7 +305,7 @@ fn parse_tombstone(json: &Value) -> Option<Tombstone> {
 ///
 /// 1. concatenate every device's lines (the caller does that);
 /// 2. drop any decision revoked by a tombstone, **whichever file the tombstone came from**;
-/// 3. group by `(window, signature match key)`;
+/// 3. group by `(window, signature match key)`, with `outcome: category` grouped apart;
 /// 4. within a group keep the highest `created_at`; ties break on lowest `created_by`, then lowest
 ///    `id`.
 ///
@@ -321,11 +337,20 @@ pub fn merge_decisions(records: &[SharedRecord]) -> Vec<Decision> {
         if revoked.contains(decision.id.as_str()) {
             continue;
         }
+        // A category decision gets a lane of its own (roadmap 4.14). It is not an answer to the
+        // overlap, so it must not replace the one recorded over the same block, nor be replaced by
+        // it: tapping "count as Study" on a block already resolved keeps both.
+        let lane = if decision.resolution.outcome == OUTCOME_CATEGORY {
+            "\u{1D}category"
+        } else {
+            ""
+        };
         let key = format!(
-            "{}\u{1D}{}\u{1D}{}",
+            "{}\u{1D}{}\u{1D}{}{}",
             decision.window.start,
             decision.window.end,
-            decision.signature.match_key()
+            decision.signature.match_key(),
+            lane
         );
         match groups.iter_mut().find(|(k, _)| *k == key) {
             Some((_, held)) => {

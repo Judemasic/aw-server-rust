@@ -38,8 +38,8 @@
 use std::collections::HashMap;
 
 use crate::decision::{
-    Decision, ForegroundPick, Participant, Signature, OUTCOME_FOREGROUND, OUTCOME_IGNORE,
-    OUTCOME_RELABEL,
+    Decision, ForegroundPick, Participant, Signature, OUTCOME_CATEGORY, OUTCOME_FOREGROUND,
+    OUTCOME_IGNORE, OUTCOME_RELABEL, SCOPE_ONCE,
 };
 use crate::{activity_label, Segment, SegmentState};
 
@@ -55,10 +55,16 @@ pub(crate) fn apply(
     if decisions.is_empty() {
         return;
     }
+    apply_categories(segments, decisions);
     // Rules are signature-keyed and window-free, so their best candidate can be chosen once for the
     // whole day rather than rescanned per segment.
     let mut best_rule: HashMap<String, &Decision> = HashMap::new();
-    for decision in decisions.iter().filter(|d| d.is_rule()) {
+    // A category decision is not an answer to an overlap (see `apply_categories`), so it must not
+    // take the one rule slot a signature has from a decision that is.
+    for decision in decisions
+        .iter()
+        .filter(|d| d.is_rule() && d.resolution.outcome != OUTCOME_CATEGORY)
+    {
         let key = decision.signature.match_key();
         match best_rule.get(&key) {
             Some(held) if !crate::decision::wins(decision, held) => {}
@@ -116,12 +122,57 @@ pub(crate) fn apply(
     }
 }
 
+/// Roadmap 4.14 — put each segment an `outcome: category` decision covers into that category.
+///
+/// **A pass of its own, not a fourth outcome of the one above**, because a segment carries exactly
+/// one answer and this is not one. *"That hour of YouTube was study"* says what kind of time it was
+/// and nothing about whose; had it competed for [`Segment::resolved_by`], putting a contended hour
+/// into Study would have quietly settled the overlap, and answering the overlap afterwards would
+/// have thrown the category away. So [`can_act_on`] knows nothing of it and it touches no field
+/// that pass writes.
+///
+/// `scope: once` only, and covers-not-equals, both for the reasons the module note gives. Where two
+/// windows cover one segment the same precedence the merge uses picks between them, so the most
+/// recent tap wins. A decision naming no category is ignored rather than read as "Uncategorized".
+fn apply_categories(segments: &mut [Segment], decisions: &[Decision]) {
+    let covering: Vec<(&Decision, (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>))> =
+        decisions
+            .iter()
+            .filter(|d| {
+                d.resolution.outcome == OUTCOME_CATEGORY
+                    && d.scope == SCOPE_ONCE
+                    && !d.resolution.category.is_empty()
+            })
+            .filter_map(|d| d.window_bounds().map(|w| (d, w)))
+            .collect();
+    if covering.is_empty() {
+        return;
+    }
+    for seg in segments.iter_mut() {
+        let mut best: Option<&Decision> = None;
+        for (decision, (start, end)) in &covering {
+            if *start > seg.start || *end < seg.end {
+                continue;
+            }
+            best = match best {
+                Some(held) if !crate::decision::wins(decision, held) => Some(held),
+                _ => Some(decision),
+            };
+        }
+        if let Some(d) = best {
+            seg.category_override = Some(d.resolution.category.clone());
+            seg.category_by = Some(d.id.clone());
+        }
+    }
+}
+
 /// Whether this decision has anything to say about this segment.
 ///
 /// A `foreground` pick can only settle a segment the picked activity is actually part of; see the
 /// module note. An outcome this build does not recognise says nothing about any segment — §8 says
 /// ignore what we do not understand — and it must not consume precedence over a rule that *is*
-/// understood, either.
+/// understood, either. `outcome: category` falls through to `false` on purpose: it is applied by
+/// [`apply_categories`], and is not an answer this pass may settle anything with.
 fn can_act_on(seg: &Segment, decision: &Decision, roles: &HashMap<String, String>) -> bool {
     match decision.resolution.outcome.as_str() {
         OUTCOME_FOREGROUND => decision

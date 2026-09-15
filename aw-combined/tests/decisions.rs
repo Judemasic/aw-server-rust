@@ -402,3 +402,120 @@ fn a_rule_recorded_with_uuid_roles_still_applies() {
     assert_eq!(segs[0].resolved_by.as_deref(), Some("r_old"));
     assert!(segs[0].auto_resolved);
 }
+
+// ---------------------------------------------------------------------------------------------
+// Roadmap 4.14 — "count this stretch as another category"
+// ---------------------------------------------------------------------------------------------
+
+fn counts_as(path: &[&str]) -> Value {
+    json!({
+        "outcome": "category", "foreground": null, "label": null, "category": path,
+        "deliberate_background": [],
+    })
+}
+
+#[test]
+fn a_category_decision_puts_the_stretch_in_that_category() {
+    let segs = overlap(
+        &[decision("c_1", "2026-09-10T11:00:00Z", PHONE, (0, 60), counts_as(&["Study"]), "once")],
+        PHONE,
+    );
+    assert_eq!(segs.len(), 1);
+    assert_eq!(segs[0].category_override, Some(vec!["Study".to_string()]));
+    assert_eq!(segs[0].category_by.as_deref(), Some("c_1"));
+    assert!(!segs[0].ignored, "it still counts, just somewhere else");
+}
+
+/// The owner's use is "YouTube was study". Where YouTube was also overlapping the tablet, saying
+/// so must not quietly settle the overlap: it says what kind of time it was, not whose.
+#[test]
+fn a_category_decision_is_not_an_answer_to_the_overlap() {
+    let segs = overlap(
+        &[decision("c_1", "2026-09-10T11:00:00Z", PHONE, (0, 60), counts_as(&["Study"]), "once")],
+        PHONE,
+    );
+    assert!(segs[0].resolved_by.is_none());
+    assert!(segs[0].unresolved, "still asked about");
+}
+
+/// Same window, same cast: the merge used to keep one of the two and drop the other.
+#[test]
+fn a_category_and_an_answer_over_the_same_block_both_survive() {
+    let lines = [
+        decision("d_1", "2026-09-10T11:00:00Z", PHONE, (0, 60), picks_kindle(), "once"),
+        decision("c_1", "2026-09-10T11:05:00Z", PHONE, (0, 60), counts_as(&["Study"]), "once"),
+    ];
+    for order in [[0, 1], [1, 0]] {
+        let segs = overlap(&[lines[order[0]].clone(), lines[order[1]].clone()], PHONE);
+        assert_eq!(segs[0].resolved_by.as_deref(), Some("d_1"), "the answer stays");
+        assert_eq!(segs[0].category_by.as_deref(), Some("c_1"), "and so does the category");
+    }
+}
+
+#[test]
+fn the_newer_of_two_category_decisions_wins() {
+    let segs = overlap(
+        &[
+            decision("c_2", "2026-09-10T11:10:00Z", PHONE, (0, 60), counts_as(&["Work", "Reading"]), "once"),
+            decision("c_1", "2026-09-10T11:00:00Z", TABLET, (0, 60), counts_as(&["Study"]), "once"),
+        ],
+        PHONE,
+    );
+    assert_eq!(
+        segs[0].category_override,
+        Some(vec!["Work".to_string(), "Reading".to_string()])
+    );
+}
+
+#[test]
+fn undoing_a_category_decision_puts_the_app_category_back() {
+    let tombstone = json!({
+        "id": "t_1", "type": "tombstone", "created_at": "2026-09-10T12:00:00Z",
+        "created_by": PHONE, "revokes": "c_1",
+    })
+    .to_string();
+    let segs = overlap(
+        &[
+            decision("c_1", "2026-09-10T11:00:00Z", PHONE, (0, 60), counts_as(&["Study"]), "once"),
+            tombstone,
+        ],
+        PHONE,
+    );
+    assert!(segs[0].category_override.is_none());
+    assert!(segs[0].category_by.is_none());
+}
+
+/// Covers, not clips — the same rule every windowed decision follows. The fixture is one atomic
+/// segment, so a window over half of it applies to none of it.
+#[test]
+fn a_category_decision_covers_only_its_own_window() {
+    let narrow = overlap(
+        &[decision("c_1", "2026-09-10T11:05:00Z", PHONE, (0, 30), counts_as(&["Study"]), "once")],
+        PHONE,
+    );
+    assert!(
+        narrow.iter().all(|s| s.category_override.is_none()),
+        "a window that does not cover a segment does not recategorise any of it"
+    );
+}
+
+#[test]
+fn a_category_decision_naming_nothing_changes_nothing() {
+    let segs = overlap(
+        &[decision("c_1", "2026-09-10T11:00:00Z", PHONE, (0, 60), counts_as(&[]), "once")],
+        PHONE,
+    );
+    assert!(segs[0].category_override.is_none());
+}
+
+/// A category decision recorded as a rule must not take the rule slot from a real answer.
+#[test]
+fn a_category_rule_does_not_shadow_an_answer_rule() {
+    let lines = [
+        decision("r_1", "2026-09-10T11:00:00Z", PHONE, (200, 260), picks_kindle(), "always"),
+        decision("r_2", "2026-09-10T11:30:00Z", PHONE, (200, 260), counts_as(&["Study"]), "always"),
+    ];
+    let segs = overlap(&lines, PHONE);
+    assert_eq!(segs[0].resolved_by.as_deref(), Some("r_1"));
+    assert!(segs[0].category_override.is_none(), "category decisions are once-only");
+}

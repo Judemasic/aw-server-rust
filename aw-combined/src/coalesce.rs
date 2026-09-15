@@ -149,6 +149,9 @@ fn mergeable(prev: &Segment, next: &Segment) -> bool {
         && prev.resolved_by == next.resolved_by
         && prev.auto_resolved == next.auto_resolved
         && prev.label_override == next.label_override
+        // Two stretches put in a category by two separate taps stay two blocks, so each one's
+        // undo takes back only itself.
+        && prev.category_by == next.category_by
         && prev.ignored == next.ignored
         && prev.not_counted == next.not_counted
         && prev.deliberate_background == next.deliberate_background

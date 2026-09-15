@@ -234,6 +234,16 @@ pub struct Segment {
     /// (`outcome: relabel`). Replaces the label shown; the time still counts to ⑤'s pick, because
     /// a relabel says *what* it was, not *whose* it was.
     pub label_override: Option<String>,
+    /// The category the owner said this stretch counts toward (`outcome: category`, roadmap 4.14),
+    /// in place of whatever its app is categorised as. `None` means "categorise it by its app", as
+    /// every earlier phase did.
+    ///
+    /// Deliberately independent of [`Segment::resolved_by`]: saying an hour of YouTube was study
+    /// says nothing about which device's YouTube it was, so it neither settles an overlap nor is
+    /// displaced by the answer that did.
+    pub category_override: Option<Vec<String>>,
+    /// Id of the decision that set [`Segment::category_override`], so the view can undo exactly it.
+    pub category_by: Option<String>,
     /// True when the owner said they were away (`outcome: ignore`): the segment draws, but its
     /// seconds count toward no total.
     pub ignored: bool,

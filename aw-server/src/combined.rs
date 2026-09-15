@@ -533,6 +533,10 @@ fn combined_row(seg: &Segment, question: Option<usize>) -> Value {
         "not_counted": seg.not_counted,
         "excluded_labels": seg.excluded_labels,
         "relabelled": seg.label_override.is_some(),
+        // Roadmap 4.14: the category the owner put this stretch in, overriding what its app would
+        // be categorised as, and the decision that did it (for undo). Both null when untouched.
+        "category": seg.category_override,
+        "category_by": seg.category_by,
         "deliberate_background": seg.deliberate_background,
         // Roadmap 4.5. What ⑦ rounded into this block, so the view can say so.
         "smoothed_seconds": seg.smoothed_seconds,
